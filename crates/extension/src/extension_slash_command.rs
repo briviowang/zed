@@ -1,9 +1,11 @@
 use std::sync::{atomic::AtomicBool, Arc};
 
 use anyhow::{anyhow, Result};
-use assistant_slash_command::{SlashCommand, SlashCommandOutput, SlashCommandOutputSection};
+use assistant_slash_command::{
+    ArgumentCompletion, SlashCommand, SlashCommandOutput, SlashCommandOutputSection,
+};
 use futures::FutureExt;
-use gpui::{AppContext, Task, WeakView, WindowContext};
+use gpui::{Task, WeakView, WindowContext};
 use language::LspAdapterDelegate;
 use ui::prelude::*;
 use wasmtime_wasi::WasiView;
@@ -37,11 +39,12 @@ impl SlashCommand for ExtensionSlashCommand {
 
     fn complete_argument(
         self: Arc<Self>,
-        query: String,
+        arguments: &[String],
         _cancel: Arc<AtomicBool>,
         _workspace: Option<WeakView<Workspace>>,
-        cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
+        cx: &mut WindowContext,
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
+        let arguments = arguments.to_owned();
         cx.background_executor().spawn(async move {
             self.extension
                 .call({
@@ -52,12 +55,22 @@ impl SlashCommand for ExtensionSlashCommand {
                                 .call_complete_slash_command_argument(
                                     store,
                                     &this.command,
-                                    query.as_ref(),
+                                    &arguments,
                                 )
                                 .await?
                                 .map_err(|e| anyhow!("{}", e))?;
 
-                            anyhow::Ok(completions)
+                            anyhow::Ok(
+                                completions
+                                    .into_iter()
+                                    .map(|completion| ArgumentCompletion {
+                                        label: completion.label.into(),
+                                        new_text: completion.new_text,
+                                        replace_previous_arguments: false,
+                                        after_completion: completion.run_command.into(),
+                                    })
+                                    .collect(),
+                            )
                         }
                         .boxed()
                     }
@@ -68,26 +81,25 @@ impl SlashCommand for ExtensionSlashCommand {
 
     fn run(
         self: Arc<Self>,
-        argument: Option<&str>,
+        arguments: &[String],
         _workspace: WeakView<Workspace>,
-        delegate: Arc<dyn LspAdapterDelegate>,
+        delegate: Option<Arc<dyn LspAdapterDelegate>>,
         cx: &mut WindowContext,
     ) -> Task<Result<SlashCommandOutput>> {
-        let argument = argument.map(|arg| arg.to_string());
+        let arguments = arguments.to_owned();
         let output = cx.background_executor().spawn(async move {
             self.extension
                 .call({
                     let this = self.clone();
                     move |extension, store| {
                         async move {
-                            let resource = store.data_mut().table().push(delegate)?;
+                            let resource = if let Some(delegate) = delegate {
+                                Some(store.data_mut().table().push(delegate)?)
+                            } else {
+                                None
+                            };
                             let output = extension
-                                .call_run_slash_command(
-                                    store,
-                                    &this.command,
-                                    argument.as_deref(),
-                                    resource,
-                                )
+                                .call_run_slash_command(store, &this.command, &arguments, resource)
                                 .await?
                                 .map_err(|e| anyhow!("{}", e))?;
 

@@ -11,6 +11,7 @@ use calloop_wayland_source::WaylandSource;
 use collections::HashMap;
 use filedescriptor::Pipe;
 
+use http_client::Url;
 use smallvec::SmallVec;
 use util::ResultExt;
 use wayland_backend::client::ObjectId;
@@ -61,7 +62,6 @@ use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blu
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
 use xkbcommon::xkb::{self, Keycode, KEYMAP_COMPILE_NO_FLAGS};
 
-use super::super::{open_uri_internal, read_fd, DOUBLE_CLICK_INTERVAL};
 use super::display::WaylandDisplay;
 use super::window::{ImeInput, WaylandWindowStatePtr};
 use crate::platform::linux::wayland::clipboard::{
@@ -72,11 +72,14 @@ use crate::platform::linux::wayland::serial::{SerialKind, SerialTracker};
 use crate::platform::linux::wayland::window::WaylandWindow;
 use crate::platform::linux::xdg_desktop_portal::{Event as XDPEvent, XDPEventSource};
 use crate::platform::linux::LinuxClient;
-use crate::platform::linux::{get_xkb_compose_state, is_within_click_distance};
+use crate::platform::linux::{
+    get_xkb_compose_state, is_within_click_distance, open_uri_internal, read_fd,
+    reveal_path_internal,
+};
 use crate::platform::PlatformWindow;
 use crate::{
     point, px, size, Bounds, DevicePixels, FileDropEvent, ForegroundExecutor, MouseExitEvent, Size,
-    SCROLL_LINES,
+    DOUBLE_CLICK_INTERVAL, SCROLL_LINES,
 };
 use crate::{
     AnyWindowHandle, CursorStyle, DisplayId, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
@@ -138,7 +141,7 @@ impl Globals {
             primary_selection_manager: globals.bind(&qh, 1..=1, ()).ok(),
             shm: globals.bind(&qh, 1..=1, ()).unwrap(),
             seat,
-            wm_base: globals.bind(&qh, 1..=1, ()).unwrap(),
+            wm_base: globals.bind(&qh, 2..=5, ()).unwrap(),
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -220,7 +223,7 @@ pub(crate) struct WaylandClientState {
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
     cursor: Cursor,
-    pending_open_uri: Option<String>,
+    pending_activation: Option<PendingActivation>,
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     common: LinuxCommon,
 }
@@ -244,6 +247,15 @@ pub(crate) struct KeyRepeat {
     current_keycode: Option<xkb::Keycode>,
 }
 
+pub(crate) enum PendingActivation {
+    /// URI to open in the web browser.
+    Uri(String),
+    /// Path to open in the file explorer.
+    Path(PathBuf),
+    /// A window from ourselves to raise.
+    Window(ObjectId),
+}
+
 /// This struct is required to conform to Rust's orphan rules, so we can dispatch on the state but hand the
 /// window to GPUI.
 #[derive(Clone)]
@@ -258,6 +270,11 @@ impl WaylandClientStatePtr {
 
     pub fn get_serial(&self, kind: SerialKind) -> u32 {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
+    }
+
+    pub fn set_pending_activation(&self, window: ObjectId) {
+        self.0.upgrade().unwrap().borrow_mut().pending_activation =
+            Some(PendingActivation::Window(window));
     }
 
     pub fn enable_ime(&self) {
@@ -293,6 +310,23 @@ impl WaylandClientStatePtr {
             text_input.disable();
             text_input.commit();
         }
+    }
+
+    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if state.composing || state.text_input.is_none() {
+            return;
+        }
+
+        let text_input = state.text_input.as_ref().unwrap();
+        text_input.set_cursor_rectangle(
+            bounds.origin.x.0 as i32,
+            bounds.origin.y.0 as i32,
+            bounds.size.width.0 as i32,
+            bounds.size.height.0 as i32,
+        );
+        text_input.commit();
     }
 
     pub fn drop_window(&self, surface_id: &ObjectId) {
@@ -378,6 +412,7 @@ impl WaylandClient {
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
+        #[allow(clippy::mutable_key_type)]
         let mut in_progress_outputs = HashMap::default();
         globals.contents().with_list(|list| {
             for global in list {
@@ -530,7 +565,7 @@ impl WaylandClient {
             data_offers: Vec::new(),
             primary_data_offer: None,
             cursor,
-            pending_open_uri: None,
+            pending_activation: None,
             event_loop: Some(event_loop),
         }));
 
@@ -629,14 +664,33 @@ impl LinuxClient for WaylandClient {
             state.globals.activation.clone(),
             state.mouse_focused_window.clone(),
         ) {
-            state.pending_open_uri = Some(uri.to_owned());
+            state.pending_activation = Some(PendingActivation::Uri(uri.to_string()));
             let token = activation.get_activation_token(&state.globals.qh, ());
             let serial = state.serial_tracker.get(SerialKind::MousePress);
             token.set_serial(serial, &state.wl_seat);
             token.set_surface(&window.surface());
             token.commit();
         } else {
-            open_uri_internal(uri, None);
+            let executor = state.common.background_executor.clone();
+            open_uri_internal(executor, uri, None);
+        }
+    }
+
+    fn reveal_path(&self, path: PathBuf) {
+        let mut state = self.0.borrow_mut();
+        if let (Some(activation), Some(window)) = (
+            state.globals.activation.clone(),
+            state.mouse_focused_window.clone(),
+        ) {
+            state.pending_activation = Some(PendingActivation::Path(path));
+            let token = activation.get_activation_token(&state.globals.qh, ());
+            let serial = state.serial_tracker.get(SerialKind::MousePress);
+            token.set_serial(serial, &state.wl_seat);
+            token.set_surface(&window.surface());
+            token.commit();
+        } else {
+            let executor = state.common.background_executor.clone();
+            reveal_path_internal(executor, path, None);
         }
     }
 
@@ -711,6 +765,10 @@ impl LinuxClient for WaylandClient {
             .keyboard_focused_window
             .as_ref()
             .map(|window| window.handle())
+    }
+
+    fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        None
     }
 
     fn compositor_name(&self) -> &'static str {
@@ -809,7 +867,7 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
 
         match event {
             wl_callback::Event::Done { .. } => {
-                window.frame(true);
+                window.frame();
             }
             _ => {}
         }
@@ -838,6 +896,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {
         let Some(window) = get_window(&mut state, &surface.id()) else {
             return;
         };
+        #[allow(clippy::mutable_key_type)]
         let outputs = state.outputs.clone();
         drop(state);
 
@@ -923,7 +982,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ObjectId> for WaylandClientStatePtr {
         let should_close = window.handle_toplevel_event(event);
 
         if should_close {
-            this.drop_window(surface_id);
+            // The close logic will be handled in drop_window()
+            window.close();
         }
     }
 }
@@ -954,13 +1014,25 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
     ) {
         let client = this.get_client();
         let mut state = client.borrow_mut();
+
         if let xdg_activation_token_v1::Event::Done { token } = event {
-            if let Some(uri) = state.pending_open_uri.take() {
-                open_uri_internal(&uri, Some(&token));
-            } else {
-                log::error!("called while pending_open_uri is None");
+            let executor = state.common.background_executor.clone();
+            match state.pending_activation.take() {
+                Some(PendingActivation::Uri(uri)) => open_uri_internal(executor, &uri, Some(token)),
+                Some(PendingActivation::Path(path)) => {
+                    reveal_path_internal(executor, path, Some(token))
+                }
+                Some(PendingActivation::Window(window)) => {
+                    let Some(window) = get_window(&mut state, &window) else {
+                        return;
+                    };
+                    let activation = state.globals.activation.as_ref().unwrap();
+                    activation.activate(token, &window.surface());
+                }
+                None => log::error!("activation token received with no pending activation"),
             }
         }
+
         token.destroy();
     }
 }
@@ -1056,10 +1128,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 state.keymap_state = Some(xkb::State::new(&keymap));
                 state.compose_state = get_xkb_compose_state(&xkb_context);
             }
-            wl_keyboard::Event::Enter {
-                serial, surface, ..
-            } => {
-                state.serial_tracker.update(SerialKind::KeyEnter, serial);
+            wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
 
@@ -1072,7 +1141,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
                 state.enter_token.take();
-                state.clipboard.set_offer(None);
+                // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
+                state.repeat.current_id += 1;
 
                 if let Some(window) = keyboard_focused_window {
                     if let Some(ref mut compose) = state.compose_state {
@@ -1194,7 +1264,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                         && state.repeat.current_keycode.is_some()
                                         && state.keyboard_focused_window.is_some();
 
-                                    if !is_repeating {
+                                    if !is_repeating || rate == 0 {
                                         return TimeoutAction::Drop;
                                     }
 
@@ -1301,6 +1371,7 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                         }
                     }
                 } else {
+                    state.composing = false;
                     drop(state);
                     window.handle_ime(ImeInput::DeleteText);
                 }
@@ -1356,6 +1427,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
 
                 if let Some(window) = get_window(&mut state, &surface.id()) {
                     state.mouse_focused_window = Some(window.clone());
+
                     if state.enter_token.is_some() {
                         state.enter_token = None;
                     }
@@ -1369,7 +1441,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         }
                     }
                     drop(state);
-                    window.set_focused(true);
+                    window.set_hovered(true);
                 }
             }
             wl_pointer::Event::Leave { .. } => {
@@ -1385,7 +1457,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
 
                     drop(state);
                     focused_window.handle_input(input);
-                    focused_window.set_focused(false);
+                    focused_window.set_hovered(false);
                 }
             }
             wl_pointer::Event::Motion {
@@ -1508,6 +1580,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if state.axis_source == AxisSource::Wheel {
                     return;
                 }
+                let axis = if state.modifiers.shift {
+                    wl_pointer::Axis::HorizontalScroll
+                } else {
+                    axis
+                };
                 let axis_modifier = match axis {
                     wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
                     wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
@@ -1533,6 +1610,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 discrete,
             } => {
                 state.scroll_event_received = true;
+                let axis = if state.modifiers.shift {
+                    wl_pointer::Axis::HorizontalScroll
+                } else {
+                    axis
+                };
                 let axis_modifier = match axis {
                     wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
                     wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
@@ -1555,6 +1637,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 value120,
             } => {
                 state.scroll_event_received = true;
+                let axis = if state.modifiers.shift {
+                    wl_pointer::Axis::HorizontalScroll
+                } else {
+                    axis
+                };
                 let axis_modifier = match axis {
                     wl_pointer::Axis::VerticalScroll => state.vertical_modifier,
                     wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
@@ -1729,13 +1816,13 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
 
                             let paths: SmallVec<[_; 2]> = file_list
                                 .lines()
-                                .map(|path| PathBuf::from(path.replace("file://", "")))
+                                .filter_map(|path| Url::parse(path).log_err())
+                                .filter_map(|url| url.to_file_path().log_err())
                                 .collect();
                             let position = Point::new(x.into(), y.into());
 
                             // Prevent dropping text from other programs.
                             if paths.is_empty() {
-                                data_offer.finish();
                                 data_offer.destroy();
                                 return;
                             }

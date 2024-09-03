@@ -1,6 +1,6 @@
 use super::{create_label_for_command, SlashCommand, SlashCommandOutput};
 use anyhow::{anyhow, Result};
-use assistant_slash_command::SlashCommandOutputSection;
+use assistant_slash_command::{ArgumentCompletion, SlashCommandOutputSection};
 use fuzzy::{PathMatch, StringMatchCandidate};
 use gpui::{AppContext, Model, Task, View, WeakView};
 use language::{
@@ -20,9 +20,9 @@ use util::paths::PathMatcher;
 use util::ResultExt;
 use workspace::Workspace;
 
-pub(crate) struct DiagnosticsCommand;
+pub(crate) struct DiagnosticsSlashCommand;
 
-impl DiagnosticsCommand {
+impl DiagnosticsSlashCommand {
     fn search_paths(
         &self,
         query: String,
@@ -33,7 +33,7 @@ impl DiagnosticsCommand {
         if query.is_empty() {
             let workspace = workspace.read(cx);
             let entries = workspace.recent_navigation_history(Some(10), cx);
-            let path_prefix: Arc<str> = "".into();
+            let path_prefix: Arc<str> = Arc::default();
             Task::ready(
                 entries
                     .into_iter()
@@ -43,6 +43,7 @@ impl DiagnosticsCommand {
                         worktree_id: entry.worktree_id.to_usize(),
                         path: entry.path.clone(),
                         path_prefix: path_prefix.clone(),
+                        is_dir: false, // Diagnostics can't be produced for directories
                         distance_to_relative_ancestor: 0,
                     })
                     .collect(),
@@ -81,7 +82,7 @@ impl DiagnosticsCommand {
     }
 }
 
-impl SlashCommand for DiagnosticsCommand {
+impl SlashCommand for DiagnosticsSlashCommand {
     fn name(&self) -> String {
         "diagnostics".into()
     }
@@ -102,17 +103,21 @@ impl SlashCommand for DiagnosticsCommand {
         false
     }
 
+    fn accepts_arguments(&self) -> bool {
+        true
+    }
+
     fn complete_argument(
         self: Arc<Self>,
-        query: String,
+        arguments: &[String],
         cancellation_flag: Arc<AtomicBool>,
         workspace: Option<WeakView<Workspace>>,
-        cx: &mut AppContext,
-    ) -> Task<Result<Vec<String>>> {
+        cx: &mut WindowContext,
+    ) -> Task<Result<Vec<ArgumentCompletion>>> {
         let Some(workspace) = workspace.and_then(|workspace| workspace.upgrade()) else {
             return Task::ready(Err(anyhow!("workspace was dropped")));
         };
-        let query = query.split_whitespace().last().unwrap_or("").to_string();
+        let query = arguments.last().cloned().unwrap_or_default();
 
         let paths = self.search_paths(query.clone(), cancellation_flag.clone(), &workspace, cx);
         let executor = cx.background_executor().clone();
@@ -143,76 +148,92 @@ impl SlashCommand for DiagnosticsCommand {
                 .map(|candidate| candidate.string),
             );
 
-            Ok(matches)
+            Ok(matches
+                .into_iter()
+                .map(|completion| ArgumentCompletion {
+                    label: completion.clone().into(),
+                    new_text: completion,
+                    after_completion: assistant_slash_command::AfterCompletion::Run,
+                    replace_previous_arguments: false,
+                })
+                .collect())
         })
     }
 
     fn run(
         self: Arc<Self>,
-        argument: Option<&str>,
+        arguments: &[String],
         workspace: WeakView<Workspace>,
-        _delegate: Arc<dyn LspAdapterDelegate>,
+        _delegate: Option<Arc<dyn LspAdapterDelegate>>,
         cx: &mut WindowContext,
     ) -> Task<Result<SlashCommandOutput>> {
         let Some(workspace) = workspace.upgrade() else {
             return Task::ready(Err(anyhow!("workspace was dropped")));
         };
 
-        let options = Options::parse(argument);
+        let options = Options::parse(arguments);
 
         let task = collect_diagnostics(workspace.read(cx).project().clone(), options, cx);
+
         cx.spawn(move |_| async move {
             let Some((text, sections)) = task.await? else {
-                return Ok(SlashCommandOutput::default());
+                return Ok(SlashCommandOutput {
+                    sections: vec![SlashCommandOutputSection {
+                        range: 0..1,
+                        icon: IconName::Library,
+                        label: "No Diagnostics".into(),
+                    }],
+                    text: "\n".to_string(),
+                    run_commands_in_text: true,
+                });
             };
+
+            let sections = sections
+                .into_iter()
+                .map(|(range, placeholder_type)| SlashCommandOutputSection {
+                    range,
+                    icon: match placeholder_type {
+                        PlaceholderType::Root(_, _) => IconName::ExclamationTriangle,
+                        PlaceholderType::File(_) => IconName::File,
+                        PlaceholderType::Diagnostic(DiagnosticType::Error, _) => IconName::XCircle,
+                        PlaceholderType::Diagnostic(DiagnosticType::Warning, _) => {
+                            IconName::ExclamationTriangle
+                        }
+                    },
+                    label: match placeholder_type {
+                        PlaceholderType::Root(summary, source) => {
+                            let mut label = String::new();
+                            label.push_str("Diagnostics");
+                            if let Some(source) = source {
+                                write!(label, " ({})", source).unwrap();
+                            }
+
+                            if summary.error_count > 0 || summary.warning_count > 0 {
+                                label.push(':');
+
+                                if summary.error_count > 0 {
+                                    write!(label, " {} errors", summary.error_count).unwrap();
+                                    if summary.warning_count > 0 {
+                                        label.push_str(",");
+                                    }
+                                }
+
+                                if summary.warning_count > 0 {
+                                    write!(label, " {} warnings", summary.warning_count).unwrap();
+                                }
+                            }
+
+                            label.into()
+                        }
+                        PlaceholderType::File(file_path) => file_path.into(),
+                        PlaceholderType::Diagnostic(_, message) => message.into(),
+                    },
+                })
+                .collect();
 
             Ok(SlashCommandOutput {
                 text,
-                sections: sections
-                    .into_iter()
-                    .map(|(range, placeholder_type)| SlashCommandOutputSection {
-                        range,
-                        icon: match placeholder_type {
-                            PlaceholderType::Root(_, _) => IconName::ExclamationTriangle,
-                            PlaceholderType::File(_) => IconName::File,
-                            PlaceholderType::Diagnostic(DiagnosticType::Error, _) => {
-                                IconName::XCircle
-                            }
-                            PlaceholderType::Diagnostic(DiagnosticType::Warning, _) => {
-                                IconName::ExclamationTriangle
-                            }
-                        },
-                        label: match placeholder_type {
-                            PlaceholderType::Root(summary, source) => {
-                                let mut label = String::new();
-                                label.push_str("Diagnostics");
-                                if let Some(source) = source {
-                                    write!(label, " ({})", source).unwrap();
-                                }
-
-                                if summary.error_count > 0 || summary.warning_count > 0 {
-                                    label.push(':');
-
-                                    if summary.error_count > 0 {
-                                        write!(label, " {} errors", summary.error_count).unwrap();
-                                        if summary.warning_count > 0 {
-                                            label.push_str(",");
-                                        }
-                                    }
-
-                                    if summary.warning_count > 0 {
-                                        write!(label, " {} warnings", summary.warning_count)
-                                            .unwrap();
-                                    }
-                                }
-
-                                label.into()
-                            }
-                            PlaceholderType::File(file_path) => file_path.into(),
-                            PlaceholderType::Diagnostic(_, message) => message.into(),
-                        },
-                    })
-                    .collect(),
+                sections,
                 run_commands_in_text: false,
             })
         })
@@ -228,25 +249,20 @@ struct Options {
 const INCLUDE_WARNINGS_ARGUMENT: &str = "--include-warnings";
 
 impl Options {
-    fn parse(arguments_line: Option<&str>) -> Self {
-        arguments_line
-            .map(|arguments_line| {
-                let args = arguments_line.split_whitespace().collect::<Vec<_>>();
-                let mut include_warnings = false;
-                let mut path_matcher = None;
-                for arg in args {
-                    if arg == INCLUDE_WARNINGS_ARGUMENT {
-                        include_warnings = true;
-                    } else {
-                        path_matcher = PathMatcher::new(&[arg.to_owned()]).log_err();
-                    }
-                }
-                Self {
-                    include_warnings,
-                    path_matcher,
-                }
-            })
-            .unwrap_or_default()
+    fn parse(arguments: &[String]) -> Self {
+        let mut include_warnings = false;
+        let mut path_matcher = None;
+        for arg in arguments {
+            if arg == INCLUDE_WARNINGS_ARGUMENT {
+                include_warnings = true;
+            } else {
+                path_matcher = PathMatcher::new(&[arg.to_owned()]).log_err();
+            }
+        }
+        Self {
+            include_warnings,
+            path_matcher,
+        }
     }
 
     fn match_candidates_for_args() -> [StringMatchCandidate; 1] {
@@ -277,7 +293,7 @@ fn collect_diagnostics(
         PathBuf::try_from(path)
             .ok()
             .and_then(|path| {
-                project.read(cx).worktrees().find_map(|worktree| {
+                project.read(cx).worktrees(cx).find_map(|worktree| {
                     let worktree = worktree.read(cx);
                     let worktree_root_path = Path::new(worktree.root_name());
                     let relative_path = path.strip_prefix(worktree_root_path).ok()?;

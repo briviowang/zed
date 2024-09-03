@@ -79,7 +79,7 @@ impl EditorLspTestContext {
         let mut cx = VisualTestContext::from_window(*window.deref(), cx);
         project
             .update(&mut cx, |project, cx| {
-                project.find_or_create_local_worktree("/root", true, cx)
+                project.find_or_create_worktree("/root", true, cx)
             })
             .await
             .unwrap();
@@ -226,6 +226,7 @@ impl EditorLspTestContext {
                     ..Default::default()
                 },
                 block_comment: Some(("<!-- ".into(), " -->".into())),
+                word_characters: ['-'].into_iter().collect(),
                 ..Default::default()
             },
             Some(tree_sitter_html::language()),

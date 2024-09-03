@@ -1,7 +1,10 @@
+mod hexdocs;
+
 use std::fs;
+use std::sync::LazyLock;
 use zed::lsp::CompletionKind;
 use zed::{
-    CodeLabel, CodeLabelSpan, LanguageServerId, SlashCommand, SlashCommandOutput,
+    CodeLabel, CodeLabelSpan, KeyValueStore, LanguageServerId, SlashCommand, SlashCommandOutput,
     SlashCommandOutputSection,
 };
 use zed_extension_api::{self as zed, Result};
@@ -146,29 +149,16 @@ impl zed::Extension for GleamExtension {
         })
     }
 
-    fn complete_slash_command_argument(
-        &self,
-        command: SlashCommand,
-        _query: String,
-    ) -> Result<Vec<String>, String> {
-        match command.name.as_str() {
-            "gleam-project" => Ok(vec![
-                "apple".to_string(),
-                "banana".to_string(),
-                "cherry".to_string(),
-            ]),
-            _ => Ok(Vec::new()),
-        }
-    }
-
     fn run_slash_command(
         &self,
         command: SlashCommand,
-        _argument: Option<String>,
-        worktree: &zed::Worktree,
+        _args: Vec<String>,
+        worktree: Option<&zed::Worktree>,
     ) -> Result<SlashCommandOutput, String> {
         match command.name.as_str() {
             "gleam-project" => {
+                let worktree = worktree.ok_or_else(|| "no worktree")?;
+
                 let mut text = String::new();
                 text.push_str("You are in a Gleam project.\n");
 
@@ -186,6 +176,35 @@ impl zed::Extension for GleamExtension {
                 })
             }
             command => Err(format!("unknown slash command: \"{command}\"")),
+        }
+    }
+
+    fn suggest_docs_packages(&self, provider: String) -> Result<Vec<String>, String> {
+        match provider.as_str() {
+            "gleam-hexdocs" => {
+                static GLEAM_PACKAGES: LazyLock<Vec<String>> = LazyLock::new(|| {
+                    include_str!("../packages.txt")
+                        .lines()
+                        .filter(|line| !line.starts_with('#'))
+                        .map(|line| line.trim().to_owned())
+                        .collect()
+                });
+
+                Ok(GLEAM_PACKAGES.clone())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn index_docs(
+        &self,
+        provider: String,
+        package: String,
+        database: &KeyValueStore,
+    ) -> Result<(), String> {
+        match provider.as_str() {
+            "gleam-hexdocs" => hexdocs::index(package, database),
+            _ => Ok(()),
         }
     }
 }

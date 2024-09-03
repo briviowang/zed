@@ -76,6 +76,10 @@ pub struct ExtensionManifest {
     pub language_servers: BTreeMap<LanguageServerName, LanguageServerManifestEntry>,
     #[serde(default)]
     pub slash_commands: BTreeMap<Arc<str>, SlashCommandManifestEntry>,
+    #[serde(default)]
+    pub indexed_docs_providers: BTreeMap<Arc<str>, IndexedDocsProviderEntry>,
+    #[serde(default)]
+    pub snippets: Option<PathBuf>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
@@ -133,9 +137,11 @@ impl LanguageServerManifestEntry {
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct SlashCommandManifestEntry {
     pub description: String,
-    pub tooltip_text: String,
     pub requires_argument: bool,
 }
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct IndexedDocsProviderEntry {}
 
 impl ExtensionManifest {
     pub async fn load(fs: Arc<dyn Fs>, extension_dir: &Path) -> Result<Self> {
@@ -200,5 +206,7 @@ fn manifest_from_old_manifest(
             .collect(),
         language_servers: Default::default(),
         slash_commands: BTreeMap::default(),
+        indexed_docs_providers: BTreeMap::default(),
+        snippets: None,
     }
 }

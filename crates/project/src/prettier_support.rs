@@ -13,7 +13,7 @@ use futures::{
 };
 use gpui::{AsyncAppContext, Model, ModelContext, Task, WeakModel};
 use language::{
-    language_settings::{Formatter, LanguageSettings},
+    language_settings::{Formatter, LanguageSettings, SelectedFormatter},
     Buffer, LanguageServerName, LocalFile,
 };
 use lsp::{LanguageServer, LanguageServerId};
@@ -22,16 +22,18 @@ use paths::default_prettier_dir;
 use prettier::Prettier;
 use util::{ResultExt, TryFutureExt};
 
-use crate::{
-    Event, File, FormatOperation, PathChange, Project, ProjectEntryId, Worktree, WorktreeId,
-};
+use crate::{File, FormatOperation, PathChange, Project, ProjectEntryId, Worktree, WorktreeId};
 
 pub fn prettier_plugins_for_language(
     language_settings: &LanguageSettings,
 ) -> Option<&HashSet<String>> {
     match &language_settings.formatter {
-        Formatter::Prettier { .. } | Formatter::Auto => Some(&language_settings.prettier.plugins),
-        Formatter::LanguageServer | Formatter::External { .. } | Formatter::CodeActions(_) => None,
+        SelectedFormatter::Auto => Some(&language_settings.prettier.plugins),
+
+        SelectedFormatter::List(list) => list
+            .as_ref()
+            .contains(&Formatter::Prettier)
+            .then_some(&language_settings.prettier.plugins),
     }
 }
 
@@ -348,10 +350,14 @@ fn register_new_prettier(
                     };
                     LanguageServerName(Arc::from(name))
                 };
-                project
-                    .supplementary_language_servers
-                    .insert(new_server_id, (name, Arc::clone(prettier_server)));
-                cx.emit(Event::LanguageServerAdded(new_server_id));
+                project.lsp_store.update(cx, |lsp_store, cx| {
+                    lsp_store.register_supplementary_language_server(
+                        new_server_id,
+                        name,
+                        Arc::clone(prettier_server),
+                        cx,
+                    )
+                });
             })
             .ok();
     }
@@ -511,7 +517,8 @@ impl Project {
         buffer: &Model<Buffer>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Option<(Option<PathBuf>, PrettierTask)>> {
-        if !self.is_local() {
+        // todo(ssh remote): prettier support
+        if self.is_via_collab() || self.ssh_session.is_some() {
             return Task::ready(None);
         }
         let buffer = buffer.read(cx);

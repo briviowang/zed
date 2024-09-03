@@ -883,6 +883,14 @@ where
         self.size.height = self.size.height.clone() + double_amount;
     }
 
+    /// inset the bounds by a specified amount
+    /// Note that this may panic if T does not support negative values
+    pub fn inset(&self, amount: T) -> Self {
+        let mut result = self.clone();
+        result.dilate(T::default() - amount);
+        result
+    }
+
     /// Returns the center point of the bounds.
     ///
     /// Calculates the center by taking the origin's x and y coordinates and adding half the width and height
@@ -931,6 +939,15 @@ where
     /// ```
     pub fn half_perimeter(&self) -> T {
         self.size.width.clone() + self.size.height.clone()
+    }
+
+    /// centered_at creates a new bounds centered at the given point.
+    pub fn centered_at(center: Point<T>, size: Size<T>) -> Self {
+        let origin = Point {
+            x: center.x - size.width.half(),
+            y: center.y - size.height.half(),
+        };
+        Self::new(origin, size)
     }
 }
 
@@ -1266,10 +1283,34 @@ where
     ///     size: Size { width: 10.0, height: 20.0 },
     /// });
     /// ```
-    pub fn map_origin(self, f: impl Fn(Point<T>) -> Point<T>) -> Bounds<T> {
+    pub fn map_origin(self, f: impl Fn(T) -> T) -> Bounds<T> {
         Bounds {
-            origin: f(self.origin),
+            origin: self.origin.map(f),
             size: self.size,
+        }
+    }
+
+    /// Applies a function to the origin  of the bounds, producing a new `Bounds` with the new origin
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use zed::{Bounds, Point, Size};
+    /// let bounds = Bounds {
+    ///     origin: Point { x: 10.0, y: 10.0 },
+    ///     size: Size { width: 10.0, height: 20.0 },
+    /// };
+    /// let new_bounds = bounds.map_size(|value| value * 1.5);
+    ///
+    /// assert_eq!(new_bounds, Bounds {
+    ///     origin: Point { x: 10.0, y: 10.0 },
+    ///     size: Size { width: 15.0, height: 30.0 },
+    /// });
+    /// ```
+    pub fn map_size(self, f: impl Fn(T) -> T) -> Bounds<T> {
+        Bounds {
+            origin: self.origin,
+            size: self.size.map(f),
         }
     }
 }
@@ -1861,20 +1902,20 @@ where
 
 impl Corners<AbsoluteLength> {
     /// Converts the `AbsoluteLength` to `Pixels` based on the provided size and rem size, ensuring the resulting
-    /// `Pixels` do not exceed half of the maximum of the provided size's width and height.
+    /// `Pixels` do not exceed half of the minimum of the provided size's width and height.
     ///
     /// This method is particularly useful when dealing with corner radii, where the radius in pixels should not
     /// exceed half the size of the box it applies to, to avoid the corners overlapping.
     ///
     /// # Arguments
     ///
-    /// * `size` - The `Size<Pixels>` against which the maximum allowable radius is determined.
+    /// * `size` - The `Size<Pixels>` against which the minimum allowable radius is determined.
     /// * `rem_size` - The size of one REM unit in pixels, used for conversion if the `AbsoluteLength` is in REMs.
     ///
     /// # Returns
     ///
     /// Returns a `Corners<Pixels>` instance with each corner's length converted to pixels and clamped to the
-    /// maximum allowable radius based on the provided size.
+    /// minimum allowable radius based on the provided size.
     ///
     /// # Examples
     ///
@@ -1883,7 +1924,7 @@ impl Corners<AbsoluteLength> {
     /// let corners = Corners {
     ///     top_left: AbsoluteLength::Pixels(Pixels(15.0)),
     ///     top_right: AbsoluteLength::Rems(Rems(1.0)),
-    ///     bottom_right: AbsoluteLength::Pixels(Pixels(20.0)),
+    ///     bottom_right: AbsoluteLength::Pixels(Pixels(30.0)),
     ///     bottom_left: AbsoluteLength::Rems(Rems(2.0)),
     /// };
     /// let size = Size { width: Pixels(100.0), height: Pixels(50.0) };
@@ -1893,11 +1934,11 @@ impl Corners<AbsoluteLength> {
     /// // The resulting corners should not exceed half the size of the smallest dimension (50.0 / 2.0 = 25.0).
     /// assert_eq!(corners_in_pixels.top_left, Pixels(15.0));
     /// assert_eq!(corners_in_pixels.top_right, Pixels(16.0)); // 1 rem converted to pixels
-    /// assert_eq!(corners_in_pixels.bottom_right, Pixels(20.0).min(Pixels(25.0))); // Clamped to 25.0
-    /// assert_eq!(corners_in_pixels.bottom_left, Pixels(32.0).min(Pixels(25.0))); // 2 rems converted to pixels and clamped
+    /// assert_eq!(corners_in_pixels.bottom_right, Pixels(30.0).min(Pixels(25.0))); // Clamped to 25.0
+    /// assert_eq!(corners_in_pixels.bottom_left, Pixels(32.0).min(Pixels(25.0))); // 2 rems converted to pixels and clamped to 25.0
     /// ```
     pub fn to_pixels(&self, size: Size<Pixels>, rem_size: Pixels) -> Corners<Pixels> {
-        let max = size.width.max(size.height) / 2.;
+        let max = size.width.min(size.height) / 2.;
         Corners {
             top_left: self.top_left.to_pixels(rem_size).min(max),
             top_right: self.top_right.to_pixels(rem_size).min(max),
@@ -2288,6 +2329,18 @@ impl Pixels {
         Self(self.0.abs())
     }
 
+    /// Returns the sign of the `Pixels` value.
+    ///
+    /// # Returns
+    ///
+    /// Returns:
+    /// * `1.0` if the value is positive
+    /// * `-1.0` if the value is negative
+    /// * `0.0` if the value is zero
+    pub fn signum(&self) -> f32 {
+        self.0.signum()
+    }
+
     /// Returns the f64 value of `Pixels`.
     ///
     /// # Returns
@@ -2394,10 +2447,24 @@ impl From<usize> for Pixels {
 /// affected by the device's scale factor, `DevicePixels` always correspond to real pixels on the
 /// display.
 #[derive(
-    Add, AddAssign, Clone, Copy, Default, Div, Eq, Hash, Ord, PartialEq, PartialOrd, Sub, SubAssign,
+    Add,
+    AddAssign,
+    Clone,
+    Copy,
+    Default,
+    Div,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Sub,
+    SubAssign,
+    Serialize,
+    Deserialize,
 )]
 #[repr(transparent)]
-pub struct DevicePixels(pub(crate) i32);
+pub struct DevicePixels(pub i32);
 
 impl DevicePixels {
     /// Converts the `DevicePixels` value to the number of bytes needed to represent it in memory.

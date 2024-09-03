@@ -2,21 +2,23 @@ use crate::{Event, *};
 use fs::FakeFs;
 use futures::{future, StreamExt};
 use gpui::{AppContext, SemanticVersion, UpdateGlobal};
+use http_client::Url;
 use language::{
     language_settings::{AllLanguageSettings, LanguageSettingsContent},
-    tree_sitter_rust, tree_sitter_typescript, Diagnostic, FakeLspAdapter, LanguageConfig,
-    LanguageMatcher, LineEnding, OffsetRangeExt, Point, ToPoint,
+    tree_sitter_rust, tree_sitter_typescript, Diagnostic, DiagnosticSet, FakeLspAdapter,
+    LanguageConfig, LanguageMatcher, LineEnding, OffsetRangeExt, Point, ToPoint,
 };
-use lsp::NumberOrString;
+use lsp::{DiagnosticSeverity, NumberOrString};
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 #[cfg(not(windows))]
 use std::os;
-use std::task::Poll;
+
+use std::{mem, ops::Range, task::Poll};
 use task::{ResolvedTask, TaskContext, TaskTemplate, TaskTemplates};
 use unindent::Unindent as _;
-use util::{assert_set_eq, paths::PathMatcher, test::temp_tree};
+use util::{assert_set_eq, paths::PathMatcher, test::temp_tree, TryFutureExt as _};
 
 #[gpui::test]
 async fn test_block_via_channel(cx: &mut gpui::TestAppContext) {
@@ -80,7 +82,7 @@ async fn test_symlinks(cx: &mut gpui::TestAppContext) {
     let project = Project::test(Arc::new(RealFs::default()), [root_link_path.as_ref()], cx).await;
 
     project.update(cx, |project, cx| {
-        let tree = project.worktrees().next().unwrap().read(cx);
+        let tree = project.worktrees(cx).next().unwrap().read(cx);
         assert_eq!(tree.file_count(), 5);
         assert_eq!(
             tree.inode_for_path("fennel/grape"),
@@ -124,13 +126,13 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
     .await;
 
     let project = Project::test(fs.clone(), ["/the-root".as_ref()], cx).await;
-    let worktree = project.update(cx, |project, _| project.worktrees().next().unwrap());
+    let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
     let task_context = TaskContext::default();
 
     cx.executor().run_until_parked();
     let worktree_id = cx.update(|cx| {
         project.update(cx, |project, cx| {
-            project.worktrees().next().unwrap().read(cx).id()
+            project.worktrees(cx).next().unwrap().read(cx).id()
         })
     });
     let global_task_source_kind = TaskSourceKind::Worktree {
@@ -322,6 +324,12 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
                     trigger_characters: Some(vec![".".to_string(), "::".to_string()]),
                     ..Default::default()
                 }),
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Options(
+                    lsp::TextDocumentSyncOptions {
+                        save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             ..Default::default()
@@ -336,6 +344,12 @@ async fn test_managing_language_servers(cx: &mut gpui::TestAppContext) {
                     trigger_characters: Some(vec![":".to_string()]),
                     ..Default::default()
                 }),
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Options(
+                    lsp::TextDocumentSyncOptions {
+                        save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
+                )),
                 ..Default::default()
             },
             ..Default::default()
@@ -722,7 +736,7 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
 
     // Initially, we don't load ignored files because the language server has not explicitly asked us to watch them.
     project.update(cx, |project, cx| {
-        let worktree = project.worktrees().next().unwrap();
+        let worktree = project.worktrees(cx).next().unwrap();
         assert_eq!(
             worktree
                 .read(cx)
@@ -796,7 +810,7 @@ async fn test_reporting_fs_changes_to_language_servers(cx: &mut gpui::TestAppCon
     // Now the language server has asked us to watch an ignored directory path,
     // so we recursively load it.
     project.update(cx, |project, cx| {
-        let worktree = project.worktrees().next().unwrap();
+        let worktree = project.worktrees(cx).next().unwrap();
         assert_eq!(
             worktree
                 .read(cx)
@@ -910,7 +924,7 @@ async fn test_single_file_worktrees_diagnostics(cx: &mut gpui::TestAppContext) {
                     version: None,
                     diagnostics: vec![lsp::Diagnostic {
                         range: lsp::Range::new(lsp::Position::new(0, 4), lsp::Position::new(0, 5)),
-                        severity: Some(lsp::DiagnosticSeverity::WARNING),
+                        severity: Some(DiagnosticSeverity::WARNING),
                         message: "error 2".to_string(),
                         ..Default::default()
                     }],
@@ -975,7 +989,7 @@ async fn test_omitted_diagnostics(cx: &mut gpui::TestAppContext) {
     let project = Project::test(fs, ["/root/dir".as_ref()], cx).await;
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_local_worktree("/root/dir", true, cx)
+            project.find_or_create_worktree("/root/dir", true, cx)
         })
         .await
         .unwrap();
@@ -983,7 +997,7 @@ async fn test_omitted_diagnostics(cx: &mut gpui::TestAppContext) {
 
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_local_worktree("/root/other.rs", false, cx)
+            project.find_or_create_worktree("/root/other.rs", false, cx)
         })
         .await
         .unwrap();
@@ -1120,7 +1134,7 @@ async fn test_disk_based_diagnostics_progress(cx: &mut gpui::TestAppContext) {
         },
     );
 
-    let worktree_id = project.update(cx, |p, cx| p.worktrees().next().unwrap().read(cx).id());
+    let worktree_id = project.update(cx, |p, cx| p.worktrees(cx).next().unwrap().read(cx).id());
 
     // Cause worktree to start the fake language server
     let _buffer = project
@@ -1271,10 +1285,10 @@ async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppC
             language_server_id: LanguageServerId(1)
         }
     );
-    project.update(cx, |project, _| {
+    project.update(cx, |project, cx| {
         assert_eq!(
             project
-                .language_servers_running_disk_based_diagnostics()
+                .language_servers_running_disk_based_diagnostics(cx)
                 .collect::<Vec<_>>(),
             [LanguageServerId(1)]
         );
@@ -1289,10 +1303,10 @@ async fn test_restarting_server_with_diagnostics_running(cx: &mut gpui::TestAppC
             language_server_id: LanguageServerId(1)
         }
     );
-    project.update(cx, |project, _| {
+    project.update(cx, |project, cx| {
         assert_eq!(
             project
-                .language_servers_running_disk_based_diagnostics()
+                .language_servers_running_disk_based_diagnostics(cx)
                 .collect::<Vec<_>>(),
             [] as [language::LanguageServerId; 0]
         );
@@ -1895,32 +1909,36 @@ async fn test_empty_diagnostic_ranges(cx: &mut gpui::TestAppContext) {
         .unwrap();
 
     project.update(cx, |project, cx| {
-        project
-            .update_buffer_diagnostics(
-                &buffer,
-                LanguageServerId(0),
-                None,
-                vec![
-                    DiagnosticEntry {
-                        range: Unclipped(PointUtf16::new(0, 10))..Unclipped(PointUtf16::new(0, 10)),
-                        diagnostic: Diagnostic {
-                            severity: DiagnosticSeverity::ERROR,
-                            message: "syntax error 1".to_string(),
-                            ..Default::default()
+        project.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store
+                .update_buffer_diagnostics(
+                    &buffer,
+                    LanguageServerId(0),
+                    None,
+                    vec![
+                        DiagnosticEntry {
+                            range: Unclipped(PointUtf16::new(0, 10))
+                                ..Unclipped(PointUtf16::new(0, 10)),
+                            diagnostic: Diagnostic {
+                                severity: DiagnosticSeverity::ERROR,
+                                message: "syntax error 1".to_string(),
+                                ..Default::default()
+                            },
                         },
-                    },
-                    DiagnosticEntry {
-                        range: Unclipped(PointUtf16::new(1, 10))..Unclipped(PointUtf16::new(1, 10)),
-                        diagnostic: Diagnostic {
-                            severity: DiagnosticSeverity::ERROR,
-                            message: "syntax error 2".to_string(),
-                            ..Default::default()
+                        DiagnosticEntry {
+                            range: Unclipped(PointUtf16::new(1, 10))
+                                ..Unclipped(PointUtf16::new(1, 10)),
+                            diagnostic: Diagnostic {
+                                severity: DiagnosticSeverity::ERROR,
+                                message: "syntax error 2".to_string(),
+                                ..Default::default()
+                            },
                         },
-                    },
-                ],
-                cx,
-            )
-            .unwrap();
+                    ],
+                    cx,
+                )
+                .unwrap();
+        })
     });
 
     // An empty range is extended forward to include the following character.
@@ -2027,6 +2045,7 @@ async fn test_edits_from_lsp2_with_past_version(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
 
     let language_registry = project.read_with(cx, |project, _| project.languages().clone());
     language_registry.add(rust_lang());
@@ -2091,9 +2110,9 @@ async fn test_edits_from_lsp2_with_past_version(cx: &mut gpui::TestAppContext) {
         );
     });
 
-    let edits = project
-        .update(cx, |project, cx| {
-            project.edits_from_lsp(
+    let edits = lsp_store
+        .update(cx, |lsp_store, cx| {
+            lsp_store.edits_from_lsp(
                 &buffer,
                 vec![
                     // replace body of first function
@@ -2178,6 +2197,7 @@ async fn test_edits_from_lsp2_with_edits_on_adjacent_lines(cx: &mut gpui::TestAp
     .await;
 
     let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
     let buffer = project
         .update(cx, |project, cx| project.open_local_buffer("/dir/a.rs", cx))
         .await
@@ -2185,9 +2205,9 @@ async fn test_edits_from_lsp2_with_edits_on_adjacent_lines(cx: &mut gpui::TestAp
 
     // Simulate the language server sending us a small edit in the form of a very large diff.
     // Rust-analyzer does this when performing a merge-imports code action.
-    let edits = project
-        .update(cx, |project, cx| {
-            project.edits_from_lsp(
+    let edits = lsp_store
+        .update(cx, |lsp_store, cx| {
+            lsp_store.edits_from_lsp(
                 &buffer,
                 [
                     // Replace the first use statement without editing the semicolon.
@@ -2286,6 +2306,7 @@ async fn test_invalid_edits_from_lsp2(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
     let buffer = project
         .update(cx, |project, cx| project.open_local_buffer("/dir/a.rs", cx))
         .await
@@ -2293,9 +2314,9 @@ async fn test_invalid_edits_from_lsp2(cx: &mut gpui::TestAppContext) {
 
     // Simulate the language server sending us edits in a non-ordered fashion,
     // with ranges sometimes being inverted or pointing to invalid locations.
-    let edits = project
-        .update(cx, |project, cx| {
-            project.edits_from_lsp(
+    let edits = lsp_store
+        .update(cx, |lsp_store, cx| {
+            lsp_store.edits_from_lsp(
                 &buffer,
                 [
                     lsp::TextEdit {
@@ -2465,7 +2486,7 @@ async fn test_definition(cx: &mut gpui::TestAppContext) {
     ) -> Vec<(&'a Path, bool)> {
         project
             .read(cx)
-            .worktrees()
+            .worktrees(cx)
             .map(|worktree| {
                 let worktree = worktree.read(cx);
                 (
@@ -2809,7 +2830,7 @@ async fn test_file_changes_multiple_times_on_disk(cx: &mut gpui::TestAppContext)
     .await;
 
     let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
-    let worktree = project.read_with(cx, |project, _| project.worktrees().next().unwrap());
+    let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     let buffer = project
         .update(cx, |p, cx| p.open_local_buffer("/dir/file1", cx))
         .await
@@ -2864,7 +2885,7 @@ async fn test_edit_buffer_while_it_reloads(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
-    let worktree = project.read_with(cx, |project, _| project.worktrees().next().unwrap());
+    let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
     let buffer = project
         .update(cx, |p, cx| p.open_local_buffer("/dir/file1", cx))
         .await
@@ -2966,7 +2987,7 @@ async fn test_save_as(cx: &mut gpui::TestAppContext) {
     });
     project
         .update(cx, |project, cx| {
-            let worktree_id = project.worktrees().next().unwrap().read(cx).id();
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
             let path = ProjectPath {
                 worktree_id,
                 path: Arc::from(Path::new("file1.rs")),
@@ -3026,7 +3047,7 @@ async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
     };
     let id_for_path = |path: &'static str, cx: &mut gpui::TestAppContext| {
         project.update(cx, |project, cx| {
-            let tree = project.worktrees().next().unwrap();
+            let tree = project.worktrees(cx).next().unwrap();
             tree.read(cx)
                 .entry_for_path(path)
                 .unwrap_or_else(|| panic!("no entry for path {}", path))
@@ -3044,7 +3065,7 @@ async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
     let file4_id = id_for_path("b/c/file4", cx);
 
     // Create a remote copy of this worktree.
-    let tree = project.update(cx, |project, _| project.worktrees().next().unwrap());
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
     let metadata = tree.update(cx, |tree, _| tree.metadata_proto());
 
     let updates = Arc::new(Mutex::new(Vec::new()));
@@ -3056,15 +3077,8 @@ async fn test_rescan_and_remote_updates(cx: &mut gpui::TestAppContext) {
         });
     });
 
-    let remote = cx.update(|cx| {
-        Worktree::remote(
-            0,
-            1,
-            metadata,
-            Box::new(CollabRemoteWorktreeClient(project.read(cx).client())),
-            cx,
-        )
-    });
+    let remote =
+        cx.update(|cx| Worktree::remote(0, 1, metadata, project.read(cx).client().into(), cx));
 
     cx.executor().run_until_parked();
 
@@ -3168,12 +3182,12 @@ async fn test_buffer_identity_across_renames(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs, [Path::new("/dir")], cx).await;
-    let tree = project.update(cx, |project, _| project.worktrees().next().unwrap());
+    let tree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
     let tree_id = tree.update(cx, |tree, _| tree.id());
 
     let id_for_path = |path: &'static str, cx: &mut gpui::TestAppContext| {
         project.update(cx, |project, cx| {
-            let tree = project.worktrees().next().unwrap();
+            let tree = project.worktrees(cx).next().unwrap();
             tree.read(cx)
                 .entry_for_path(path)
                 .unwrap_or_else(|| panic!("no entry for path {}", path))
@@ -3935,7 +3949,8 @@ async fn test_search(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                None
             )
             .unwrap(),
             cx
@@ -3968,7 +3983,8 @@ async fn test_search(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4011,7 +4027,8 @@ async fn test_search_with_inclusions(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 PathMatcher::new(&["*.odd".to_owned()]).unwrap(),
-                Default::default()
+                Default::default(),
+                None
             )
             .unwrap(),
             cx
@@ -4031,7 +4048,8 @@ async fn test_search_with_inclusions(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 PathMatcher::new(&["*.rs".to_owned()]).unwrap(),
-                Default::default()
+                Default::default(),
+                None
             )
             .unwrap(),
             cx
@@ -4057,6 +4075,7 @@ async fn test_search_with_inclusions(cx: &mut gpui::TestAppContext) {
                     PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
 
                 Default::default(),
+                None,
             ).unwrap(),
             cx
         )
@@ -4081,6 +4100,7 @@ async fn test_search_with_inclusions(cx: &mut gpui::TestAppContext) {
                     PathMatcher::new(&["*.rs".to_owned(), "*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
 
                Default::default(),
+               None,
             ).unwrap(),
             cx
         )
@@ -4125,6 +4145,7 @@ async fn test_search_with_exclusions(cx: &mut gpui::TestAppContext) {
                 false,
                 Default::default(),
                 PathMatcher::new(&["*.odd".to_owned()]).unwrap(),
+                None,
             )
             .unwrap(),
             cx
@@ -4149,7 +4170,8 @@ async fn test_search_with_exclusions(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 Default::default(),
-                PathMatcher::new(&["*.rs".to_owned()]).unwrap()
+                PathMatcher::new(&["*.rs".to_owned()]).unwrap(),
+                None,
             )
             .unwrap(),
             cx
@@ -4172,9 +4194,8 @@ async fn test_search_with_exclusions(cx: &mut gpui::TestAppContext) {
                 true,
                 false,
                 Default::default(),
-
-                    PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
-
+                PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
+                None,
             ).unwrap(),
             cx
         )
@@ -4198,6 +4219,7 @@ async fn test_search_with_exclusions(cx: &mut gpui::TestAppContext) {
                  Default::default(),
 
                     PathMatcher::new(&["*.rs".to_owned(), "*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
+                    None,
 
             ).unwrap(),
             cx
@@ -4237,6 +4259,7 @@ async fn test_search_with_exclusions_and_inclusions(cx: &mut gpui::TestAppContex
                 false,
                 PathMatcher::new(&["*.odd".to_owned()]).unwrap(),
                 PathMatcher::new(&["*.odd".to_owned()]).unwrap(),
+                None,
             )
             .unwrap(),
             cx
@@ -4257,6 +4280,7 @@ async fn test_search_with_exclusions_and_inclusions(cx: &mut gpui::TestAppContex
                 false,
                 PathMatcher::new(&["*.ts".to_owned()]).unwrap(),
                 PathMatcher::new(&["*.ts".to_owned()]).unwrap(),
+                None,
             ).unwrap(),
             cx
         )
@@ -4276,6 +4300,7 @@ async fn test_search_with_exclusions_and_inclusions(cx: &mut gpui::TestAppContex
                 false,
                 PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
                 PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
+                None,
             )
             .unwrap(),
             cx
@@ -4296,6 +4321,7 @@ async fn test_search_with_exclusions_and_inclusions(cx: &mut gpui::TestAppContex
                 false,
                 PathMatcher::new(&["*.ts".to_owned(), "*.odd".to_owned()]).unwrap(),
                 PathMatcher::new(&["*.rs".to_owned(), "*.odd".to_owned()]).unwrap(),
+                None,
             )
             .unwrap(),
             cx
@@ -4348,7 +4374,8 @@ async fn test_search_multiple_worktrees_with_inclusions(cx: &mut gpui::TestAppCo
                 true,
                 false,
                 PathMatcher::new(&["worktree-a/*.rs".to_owned()]).unwrap(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4367,7 +4394,8 @@ async fn test_search_multiple_worktrees_with_inclusions(cx: &mut gpui::TestAppCo
                 true,
                 false,
                 PathMatcher::new(&["worktree-b/*.rs".to_owned()]).unwrap(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4387,7 +4415,8 @@ async fn test_search_multiple_worktrees_with_inclusions(cx: &mut gpui::TestAppCo
                 true,
                 false,
                 PathMatcher::new(&["*.ts".to_owned()]).unwrap(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4441,7 +4470,8 @@ async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
                 false,
                 false,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4462,7 +4492,8 @@ async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
                 false,
                 true,
                 Default::default(),
-                Default::default()
+                Default::default(),
+                None,
             )
             .unwrap(),
             cx
@@ -4489,7 +4520,7 @@ async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
         "Unrestricted search with ignored directories should find every file with the query"
     );
 
-    let files_to_include = PathMatcher::new(&["/dir/node_modules/prettier/**".to_owned()]).unwrap();
+    let files_to_include = PathMatcher::new(&["node_modules/prettier/**".to_owned()]).unwrap();
     let files_to_exclude = PathMatcher::new(&["*.ts".to_owned()]).unwrap();
     let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
     assert_eq!(
@@ -4502,6 +4533,7 @@ async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
                 true,
                 files_to_include,
                 files_to_exclude,
+                None,
             )
             .unwrap(),
             cx
@@ -4516,12 +4548,59 @@ async fn test_search_in_gitignored_dirs(cx: &mut gpui::TestAppContext) {
     );
 }
 
-#[test]
-fn test_glob_literal_prefix() {
-    assert_eq!(glob_literal_prefix("**/*.js"), "");
-    assert_eq!(glob_literal_prefix("node_modules/**/*.js"), "node_modules");
-    assert_eq!(glob_literal_prefix("foo/{bar,baz}.js"), "foo");
-    assert_eq!(glob_literal_prefix("foo/bar/baz.js"), "foo/bar/baz.js");
+#[gpui::test]
+async fn test_search_ordering(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/dir",
+        json!({
+            ".git": {},
+            ".gitignore": "**/target\n/node_modules\n",
+            "aaa.txt": "key:value",
+            "bbb": {
+                "index.txt": "index_key:index_value"
+            },
+            "node_modules": {
+                "10 eleven": "key",
+                "1 two": "key"
+            },
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
+
+    let mut search = project.update(cx, |project, cx| {
+        project.search(
+            SearchQuery::text(
+                "key",
+                false,
+                false,
+                true,
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .unwrap(),
+            cx,
+        )
+    });
+
+    fn file_name(search_result: Option<SearchResult>, cx: &mut gpui::TestAppContext) -> String {
+        match search_result.unwrap() {
+            SearchResult::Buffer { buffer, .. } => buffer.read_with(cx, |buffer, _| {
+                buffer.file().unwrap().path().to_string_lossy().to_string()
+            }),
+            _ => panic!("Expected buffer"),
+        }
+    }
+
+    assert_eq!(file_name(search.next().await, cx), "bbb/index.txt");
+    assert_eq!(file_name(search.next().await, cx), "node_modules/1 two");
+    assert_eq!(file_name(search.next().await, cx), "node_modules/10 eleven");
+    assert_eq!(file_name(search.next().await, cx), "aaa.txt");
+    assert!(search.next().await.is_none())
 }
 
 #[gpui::test]
@@ -4544,18 +4623,18 @@ async fn test_create_entry(cx: &mut gpui::TestAppContext) {
     let project = Project::test(fs.clone(), ["/one/two/three".as_ref()], cx).await;
     project
         .update(cx, |project, cx| {
-            let id = project.worktrees().next().unwrap().read(cx).id();
+            let id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.create_entry((id, "b.."), true, cx)
         })
-        .unwrap()
         .await
+        .unwrap()
         .to_included()
         .unwrap();
 
     // Can't create paths outside the project
     let result = project
         .update(cx, |project, cx| {
-            let id = project.worktrees().next().unwrap().read(cx).id();
+            let id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.create_entry((id, "../../boop"), true, cx)
         })
         .await;
@@ -4564,7 +4643,7 @@ async fn test_create_entry(cx: &mut gpui::TestAppContext) {
     // Can't create paths with '..'
     let result = project
         .update(cx, |project, cx| {
-            let id = project.worktrees().next().unwrap().read(cx).id();
+            let id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.create_entry((id, "four/../beep"), true, cx)
         })
         .await;
@@ -4587,7 +4666,7 @@ async fn test_create_entry(cx: &mut gpui::TestAppContext) {
     // And we cannot open buffers with '..'
     let result = project
         .update(cx, |project, cx| {
-            let id = project.worktrees().next().unwrap().read(cx).id();
+            let id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.open_buffer((id, "../c.rs"), cx)
         })
         .await;
@@ -4617,9 +4696,8 @@ async fn test_multiple_language_server_hovers(cx: &mut gpui::TestAppContext) {
         "ESLintServer",
         "NoHoverCapabilitiesServer",
     ];
-    let mut fake_tsx_language_servers = language_registry.register_specific_fake_lsp_adapter(
+    let mut fake_tsx_language_servers = language_registry.register_fake_lsp_adapter(
         "tsx",
-        true,
         FakeLspAdapter {
             name: &language_server_names[0],
             capabilities: lsp::ServerCapabilities {
@@ -4629,9 +4707,8 @@ async fn test_multiple_language_server_hovers(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _a = language_registry.register_specific_fake_lsp_adapter(
+    let _a = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[1],
             capabilities: lsp::ServerCapabilities {
@@ -4641,9 +4718,8 @@ async fn test_multiple_language_server_hovers(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _b = language_registry.register_specific_fake_lsp_adapter(
+    let _b = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[2],
             capabilities: lsp::ServerCapabilities {
@@ -4653,9 +4729,8 @@ async fn test_multiple_language_server_hovers(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _c = language_registry.register_specific_fake_lsp_adapter(
+    let _c = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[3],
             capabilities: lsp::ServerCapabilities {
@@ -4841,9 +4916,8 @@ async fn test_multiple_language_server_actions(cx: &mut gpui::TestAppContext) {
         "ESLintServer",
         "NoActionsCapabilitiesServer",
     ];
-    let mut fake_tsx_language_servers = language_registry.register_specific_fake_lsp_adapter(
+    let mut fake_tsx_language_servers = language_registry.register_fake_lsp_adapter(
         "tsx",
-        true,
         FakeLspAdapter {
             name: &language_server_names[0],
             capabilities: lsp::ServerCapabilities {
@@ -4853,9 +4927,8 @@ async fn test_multiple_language_server_actions(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _a = language_registry.register_specific_fake_lsp_adapter(
+    let _a = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[1],
             capabilities: lsp::ServerCapabilities {
@@ -4865,9 +4938,8 @@ async fn test_multiple_language_server_actions(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _b = language_registry.register_specific_fake_lsp_adapter(
+    let _b = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[2],
             capabilities: lsp::ServerCapabilities {
@@ -4877,9 +4949,8 @@ async fn test_multiple_language_server_actions(cx: &mut gpui::TestAppContext) {
             ..FakeLspAdapter::default()
         },
     );
-    let _c = language_registry.register_specific_fake_lsp_adapter(
+    let _c = language_registry.register_fake_lsp_adapter(
         "tsx",
-        false,
         FakeLspAdapter {
             name: &language_server_names[3],
             capabilities: lsp::ServerCapabilities {
@@ -5206,7 +5277,7 @@ async fn search(
         .collect())
 }
 
-fn init_test(cx: &mut gpui::TestAppContext) {
+pub fn init_test(cx: &mut gpui::TestAppContext) {
     if std::env::var("RUST_LOG").is_ok() {
         env_logger::try_init().ok();
     }
