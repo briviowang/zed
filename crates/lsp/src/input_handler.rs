@@ -1,11 +1,11 @@
 use std::str;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use collections::HashMap;
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     AsyncBufReadExt, AsyncRead, AsyncReadExt as _,
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
 use gpui::{BackgroundExecutor, Task};
 use log::warn;
@@ -13,20 +13,17 @@ use parking_lot::Mutex;
 use smol::io::BufReader;
 
 use crate::{
-    AnyNotification, AnyResponse, IoHandler, IoKind, RequestId, ResponseHandler, CONTENT_LEN_HEADER,
+    AnyNotification, AnyResponse, CONTENT_LEN_HEADER, IoHandler, IoKind, RequestId, ResponseHandler,
 };
 
-const HEADER_DELIMITER: &'static [u8; 4] = b"\r\n\r\n";
+const HEADER_DELIMITER: &[u8; 4] = b"\r\n\r\n";
 /// Handler for stdout of language server.
 pub struct LspStdoutHandler {
     pub(super) loop_handle: Task<Result<()>>,
     pub(super) notifications_channel: UnboundedReceiver<AnyNotification>,
 }
 
-pub(self) async fn read_headers<Stdout>(
-    reader: &mut BufReader<Stdout>,
-    buffer: &mut Vec<u8>,
-) -> Result<()>
+async fn read_headers<Stdout>(reader: &mut BufReader<Stdout>, buffer: &mut Vec<u8>) -> Result<()>
 where
     Stdout: AsyncRead + Unpin + Send + 'static,
 {

@@ -1,4 +1,4 @@
-use crate::{db::UserId, executor::Executor, Database, Error, Result};
+use crate::{Database, Error, Result, db::UserId, executor::Executor};
 use chrono::{DateTime, Duration, Utc};
 use dashmap::{DashMap, DashSet};
 use rpc::ErrorCodeExt;
@@ -100,7 +100,7 @@ impl RateLimiter {
     pub async fn save(&self) -> Result<()> {
         let mut buckets = Vec::new();
         self.dirty_buckets.retain(|key| {
-            if let Some(bucket) = self.buckets.get(&key) {
+            if let Some(bucket) = self.buckets.get(key) {
                 buckets.push(crate::db::rate_buckets::Model {
                     user_id: key.0,
                     rate_limit_name: key.1.clone(),
@@ -189,6 +189,7 @@ mod tests {
         let user_1 = db
             .create_user(
                 "user-1@zed.dev",
+                None,
                 false,
                 NewUserParams {
                     github_login: "user-1".into(),
@@ -201,6 +202,7 @@ mod tests {
         let user_2 = db
             .create_user(
                 "user-2@zed.dev",
+                None,
                 false,
                 NewUserParams {
                     github_login: "user-2".into(),

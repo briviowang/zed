@@ -1,25 +1,39 @@
 use std::io::{Cursor, Write};
+use std::sync::Arc;
 
 use crate::role::Role;
+use crate::{LanguageModelToolUse, LanguageModelToolUseId};
 use base64::write::EncoderWriter;
-use gpui::{point, size, AppContext, DevicePixels, Image, ObjectFit, RenderImage, Size, Task};
-use image::{codecs::png::PngEncoder, imageops::resize, DynamicImage, ImageDecoder};
+use gpui::{
+    App, AppContext as _, DevicePixels, Image, ObjectFit, RenderImage, SharedString, Size, Task,
+    point, px, size,
+};
+use image::{DynamicImage, ImageDecoder, codecs::png::PngEncoder, imageops::resize};
 use serde::{Deserialize, Serialize};
-use ui::{px, SharedString};
 use util::ResultExt;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct LanguageModelImage {
-    // A base64 encoded PNG image
+    /// A base64-encoded PNG image.
     pub source: SharedString,
     size: Size<DevicePixels>,
 }
 
-const ANTHROPIC_SIZE_LIMT: f32 = 1568.0; // Anthropic wants uploaded images to be smaller than this in both dimensions
+impl std::fmt::Debug for LanguageModelImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanguageModelImage")
+            .field("source", &format!("<{} bytes>", self.source.len()))
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+/// Anthropic wants uploaded images to be smaller than this in both dimensions.
+const ANTHROPIC_SIZE_LIMT: f32 = 1568.;
 
 impl LanguageModelImage {
-    pub fn from_image(data: Image, cx: &mut AppContext) -> Task<Option<Self>> {
-        cx.background_executor().spawn(async move {
+    pub fn from_image(data: Image, cx: &mut App) -> Task<Option<Self>> {
+        cx.background_spawn(async move {
             match data.format() {
                 gpui::ImageFormat::Png
                 | gpui::ImageFormat::Jpeg
@@ -67,7 +81,7 @@ impl LanguageModelImage {
                 }
             }
 
-            // SAFETY: The base64 encoder should not produce non-UTF8
+            // SAFETY: The base64 encoder should not produce non-UTF8.
             let source = unsafe { String::from_utf8_unchecked(base64_image) };
 
             Some(LanguageModelImage {
@@ -77,7 +91,7 @@ impl LanguageModelImage {
         })
     }
 
-    /// Resolves image into an LLM-ready format (base64)
+    /// Resolves image into an LLM-ready format (base64).
     pub fn from_render_image(data: &RenderImage) -> Option<Self> {
         let image_size = data.size(0);
 
@@ -130,7 +144,7 @@ impl LanguageModelImage {
             base64_encoder.write_all(png.as_slice()).log_err()?;
         }
 
-        // SAFETY: The base64 encoder should not produce non-UTF8
+        // SAFETY: The base64 encoder should not produce non-UTF8.
         let source = unsafe { String::from_utf8_unchecked(base64_image) };
 
         Some(LanguageModelImage {
@@ -144,37 +158,26 @@ impl LanguageModelImage {
         let height = self.size.height.0.unsigned_abs() as usize;
 
         // From: https://docs.anthropic.com/en/docs/build-with-claude/vision#calculate-image-costs
-        // Note that are a lot of conditions on anthropic's API, and OpenAI doesn't use this,
-        // so this method is more of a rough guess
+        // Note that are a lot of conditions on Anthropic's API, and OpenAI doesn't use this,
+        // so this method is more of a rough guess.
         (width * height) / 750
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct LanguageModelToolResult {
+    pub tool_use_id: LanguageModelToolUseId,
+    pub tool_name: Arc<str>,
+    pub is_error: bool,
+    pub content: Arc<str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum MessageContent {
     Text(String),
     Image(LanguageModelImage),
-}
-
-impl std::fmt::Debug for MessageContent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MessageContent::Text(t) => f.debug_struct("MessageContent").field("text", t).finish(),
-            MessageContent::Image(i) => f
-                .debug_struct("MessageContent")
-                .field("image", &i.source.len())
-                .finish(),
-        }
-    }
-}
-
-impl MessageContent {
-    pub fn as_string(&self) -> &str {
-        match self {
-            MessageContent::Text(s) => s.as_str(),
-            MessageContent::Image(_) => "",
-        }
-    }
+    ToolUse(LanguageModelToolUse),
+    ToolResult(LanguageModelToolResult),
 }
 
 impl From<String> for MessageContent {
@@ -198,24 +201,29 @@ pub struct LanguageModelRequestMessage {
 
 impl LanguageModelRequestMessage {
     pub fn string_contents(&self) -> String {
-        let mut string_buffer = String::new();
+        let mut buffer = String::new();
         for string in self.content.iter().filter_map(|content| match content {
-            MessageContent::Text(s) => Some(s),
-            MessageContent::Image(_) => None,
+            MessageContent::Text(text) => Some(text.as_str()),
+            MessageContent::ToolResult(tool_result) => Some(tool_result.content.as_ref()),
+            MessageContent::ToolUse(_) | MessageContent::Image(_) => None,
         }) {
-            string_buffer.push_str(string.as_str())
+            buffer.push_str(string);
         }
-        string_buffer
+
+        buffer
     }
 
     pub fn contents_empty(&self) -> bool {
         self.content.is_empty()
             || self
                 .content
-                .get(0)
+                .first()
                 .map(|content| match content {
-                    MessageContent::Text(s) => s.trim().is_empty(),
-                    MessageContent::Image(_) => true,
+                    MessageContent::Text(text) => text.chars().all(|c| c.is_whitespace()),
+                    MessageContent::ToolResult(tool_result) => {
+                        tool_result.content.chars().all(|c| c.is_whitespace())
+                    }
+                    MessageContent::ToolUse(_) | MessageContent::Image(_) => true,
                 })
                 .unwrap_or(false)
     }
@@ -233,153 +241,7 @@ pub struct LanguageModelRequest {
     pub messages: Vec<LanguageModelRequestMessage>,
     pub tools: Vec<LanguageModelRequestTool>,
     pub stop: Vec<String>,
-    pub temperature: f32,
-}
-
-impl LanguageModelRequest {
-    pub fn into_open_ai(self, model: String, max_output_tokens: Option<u32>) -> open_ai::Request {
-        open_ai::Request {
-            model,
-            messages: self
-                .messages
-                .into_iter()
-                .map(|msg| match msg.role {
-                    Role::User => open_ai::RequestMessage::User {
-                        content: msg.string_contents(),
-                    },
-                    Role::Assistant => open_ai::RequestMessage::Assistant {
-                        content: Some(msg.string_contents()),
-                        tool_calls: Vec::new(),
-                    },
-                    Role::System => open_ai::RequestMessage::System {
-                        content: msg.string_contents(),
-                    },
-                })
-                .collect(),
-            stream: true,
-            stop: self.stop,
-            temperature: self.temperature,
-            max_tokens: max_output_tokens,
-            tools: Vec::new(),
-            tool_choice: None,
-        }
-    }
-
-    pub fn into_google(self, model: String) -> google_ai::GenerateContentRequest {
-        google_ai::GenerateContentRequest {
-            model,
-            contents: self
-                .messages
-                .into_iter()
-                .map(|msg| google_ai::Content {
-                    parts: vec![google_ai::Part::TextPart(google_ai::TextPart {
-                        text: msg.string_contents(),
-                    })],
-                    role: match msg.role {
-                        Role::User => google_ai::Role::User,
-                        Role::Assistant => google_ai::Role::Model,
-                        Role::System => google_ai::Role::User, // Google AI doesn't have a system role
-                    },
-                })
-                .collect(),
-            generation_config: Some(google_ai::GenerationConfig {
-                candidate_count: Some(1),
-                stop_sequences: Some(self.stop),
-                max_output_tokens: None,
-                temperature: Some(self.temperature as f64),
-                top_p: None,
-                top_k: None,
-            }),
-            safety_settings: None,
-        }
-    }
-
-    pub fn into_anthropic(self, model: String, max_output_tokens: u32) -> anthropic::Request {
-        let mut new_messages: Vec<anthropic::Message> = Vec::new();
-        let mut system_message = String::new();
-
-        for message in self.messages {
-            if message.contents_empty() {
-                continue;
-            }
-
-            match message.role {
-                Role::User | Role::Assistant => {
-                    let cache_control = if message.cache {
-                        Some(anthropic::CacheControl {
-                            cache_type: anthropic::CacheControlType::Ephemeral,
-                        })
-                    } else {
-                        None
-                    };
-                    let anthropic_message_content: Vec<anthropic::RequestContent> = message
-                        .content
-                        .into_iter()
-                        .filter_map(|content| match content {
-                            MessageContent::Text(t) if !t.is_empty() => {
-                                Some(anthropic::RequestContent::Text {
-                                    text: t,
-                                    cache_control,
-                                })
-                            }
-                            MessageContent::Image(i) => Some(anthropic::RequestContent::Image {
-                                source: anthropic::ImageSource {
-                                    source_type: "base64".to_string(),
-                                    media_type: "image/png".to_string(),
-                                    data: i.source.to_string(),
-                                },
-                                cache_control,
-                            }),
-                            _ => None,
-                        })
-                        .collect();
-                    let anthropic_role = match message.role {
-                        Role::User => anthropic::Role::User,
-                        Role::Assistant => anthropic::Role::Assistant,
-                        Role::System => unreachable!("System role should never occur here"),
-                    };
-                    if let Some(last_message) = new_messages.last_mut() {
-                        if last_message.role == anthropic_role {
-                            last_message.content.extend(anthropic_message_content);
-                            continue;
-                        }
-                    }
-                    new_messages.push(anthropic::Message {
-                        role: anthropic_role,
-                        content: anthropic_message_content,
-                    });
-                }
-                Role::System => {
-                    if !system_message.is_empty() {
-                        system_message.push_str("\n\n");
-                    }
-                    system_message.push_str(&message.string_contents());
-                }
-            }
-        }
-
-        anthropic::Request {
-            model,
-            messages: new_messages,
-            max_tokens: max_output_tokens,
-            system: Some(system_message),
-            tools: self
-                .tools
-                .into_iter()
-                .map(|tool| anthropic::Tool {
-                    name: tool.name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
-                })
-                .collect(),
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: Vec::new(),
-            temperature: None,
-            top_k: None,
-            top_p: None,
-        }
-    }
+    pub temperature: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]

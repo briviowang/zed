@@ -1,83 +1,43 @@
 #![cfg_attr(target_os = "windows", allow(unused, dead_code))]
 
+mod assistant_configuration;
 pub mod assistant_panel;
-pub mod assistant_settings;
-mod context;
-pub mod context_store;
 mod inline_assistant;
-mod model_selector;
-mod prompt_library;
-mod prompts;
-mod slash_command;
-pub(crate) mod slash_command_picker;
 pub mod slash_command_settings;
-mod streaming_diff;
 mod terminal_inline_assistant;
-mod workflow;
 
-pub use assistant_panel::{AssistantPanel, AssistantPanelEvent};
+use std::sync::Arc;
+
 use assistant_settings::AssistantSettings;
 use assistant_slash_command::SlashCommandRegistry;
-use client::{proto, Client};
+use client::Client;
 use command_palette_hooks::CommandPaletteFilter;
-pub use context::*;
-use context_servers::ContextServerRegistry;
-pub use context_store::*;
 use feature_flags::FeatureFlagAppExt;
 use fs::Fs;
-use gpui::Context as _;
-use gpui::{actions, AppContext, Global, SharedString, UpdateGlobal};
-use indexed_docs::IndexedDocsRegistry;
-pub(crate) use inline_assistant::*;
+use gpui::{App, Global, ReadGlobal, UpdateGlobal, actions};
 use language_model::{
     LanguageModelId, LanguageModelProviderId, LanguageModelRegistry, LanguageModelResponseMessage,
 };
-pub(crate) use model_selector::*;
-pub use prompts::PromptBuilder;
-use prompts::PromptLoadingParams;
-use semantic_index::{CloudEmbeddingProvider, SemanticIndex};
-use serde::{Deserialize, Serialize};
-use settings::{update_settings_file, Settings, SettingsStore};
-use slash_command::{
-    context_server_command, default_command, diagnostics_command, docs_command, fetch_command,
-    file_command, now_command, project_command, prompt_command, search_command, symbols_command,
-    tab_command, terminal_command, workflow_command,
-};
-use std::sync::Arc;
-pub(crate) use streaming_diff::*;
-use util::ResultExt;
-pub use workflow::*;
+use prompt_store::PromptBuilder;
+use serde::Deserialize;
+use settings::{Settings, SettingsStore};
 
+pub use crate::assistant_panel::{AssistantPanel, AssistantPanelEvent};
+pub(crate) use crate::inline_assistant::*;
 use crate::slash_command_settings::SlashCommandSettings;
 
 actions!(
     assistant,
     [
-        Assist,
-        Split,
-        CycleMessageRole,
-        QuoteSelection,
-        InsertIntoEditor,
-        ToggleFocus,
         InsertActivePrompt,
         DeployHistory,
-        DeployPromptLibrary,
-        ConfirmCommand,
-        NewContext,
-        ToggleModelSelector,
+        NewChat,
+        CycleNextInlineAssist,
+        CyclePreviousInlineAssist
     ]
 );
 
 const DEFAULT_CONTEXT_LINES: usize = 50;
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct MessageId(clock::Lamport);
-
-impl MessageId {
-    pub fn as_u64(self) -> u64 {
-        self.0.as_u64()
-    }
-}
 
 #[derive(Deserialize, Debug)]
 pub struct LanguageModelUsage {
@@ -93,55 +53,6 @@ pub struct LanguageModelChoiceDelta {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum MessageStatus {
-    Pending,
-    Done,
-    Error(SharedString),
-    Canceled,
-}
-
-impl MessageStatus {
-    pub fn from_proto(status: proto::ContextMessageStatus) -> MessageStatus {
-        match status.variant {
-            Some(proto::context_message_status::Variant::Pending(_)) => MessageStatus::Pending,
-            Some(proto::context_message_status::Variant::Done(_)) => MessageStatus::Done,
-            Some(proto::context_message_status::Variant::Error(error)) => {
-                MessageStatus::Error(error.message.into())
-            }
-            Some(proto::context_message_status::Variant::Canceled(_)) => MessageStatus::Canceled,
-            None => MessageStatus::Pending,
-        }
-    }
-
-    pub fn to_proto(&self) -> proto::ContextMessageStatus {
-        match self {
-            MessageStatus::Pending => proto::ContextMessageStatus {
-                variant: Some(proto::context_message_status::Variant::Pending(
-                    proto::context_message_status::Pending {},
-                )),
-            },
-            MessageStatus::Done => proto::ContextMessageStatus {
-                variant: Some(proto::context_message_status::Variant::Done(
-                    proto::context_message_status::Done {},
-                )),
-            },
-            MessageStatus::Error(message) => proto::ContextMessageStatus {
-                variant: Some(proto::context_message_status::Variant::Error(
-                    proto::context_message_status::Error {
-                        message: message.to_string(),
-                    },
-                )),
-            },
-            MessageStatus::Canceled => proto::ContextMessageStatus {
-                variant: Some(proto::context_message_status::Variant::Canceled(
-                    proto::context_message_status::Canceled {},
-                )),
-            },
-        }
-    }
-}
-
 /// The state pertaining to the Assistant.
 #[derive(Default)]
 struct Assistant {
@@ -154,7 +65,7 @@ impl Global for Assistant {}
 impl Assistant {
     const NAMESPACE: &'static str = "assistant";
 
-    fn set_enabled(&mut self, enabled: bool, cx: &mut AppContext) {
+    fn set_enabled(&mut self, enabled: bool, cx: &mut App) {
         if self.enabled == enabled {
             return;
         }
@@ -173,61 +84,31 @@ impl Assistant {
             filter.show_namespace(Self::NAMESPACE);
         });
     }
+
+    pub fn enabled(cx: &App) -> bool {
+        Self::global(cx).enabled
+    }
 }
 
 pub fn init(
     fs: Arc<dyn Fs>,
     client: Arc<Client>,
-    stdout_is_a_pty: bool,
-    cx: &mut AppContext,
-) -> Arc<PromptBuilder> {
+    prompt_builder: Arc<PromptBuilder>,
+    cx: &mut App,
+) {
     cx.set_global(Assistant::default());
     AssistantSettings::register(cx);
     SlashCommandSettings::register(cx);
 
-    // TODO: remove this when 0.148.0 is released.
-    if AssistantSettings::get_global(cx).using_outdated_settings_version {
-        update_settings_file::<AssistantSettings>(fs.clone(), cx, {
-            let fs = fs.clone();
-            |content, cx| {
-                content.update_file(fs, cx);
-            }
-        });
-    }
-
-    cx.spawn(|mut cx| {
-        let client = client.clone();
-        async move {
-            let embedding_provider = CloudEmbeddingProvider::new(client.clone());
-            let semantic_index = SemanticIndex::new(
-                paths::embeddings_dir().join("semantic-index-db.0.mdb"),
-                Arc::new(embedding_provider),
-                &mut cx,
-            )
-            .await?;
-            cx.update(|cx| cx.set_global(semantic_index))
-        }
-    })
-    .detach();
-
-    context_store::init(&client.clone().into());
+    assistant_context_editor::init(client.clone(), cx);
     prompt_library::init(cx);
     init_language_model_settings(cx);
     assistant_slash_command::init(cx);
+    assistant_tool::init(cx);
     assistant_panel::init(cx);
-    context_servers::init(cx);
+    context_server::init(cx);
 
-    let prompt_builder = prompts::PromptBuilder::new(Some(PromptLoadingParams {
-        fs: fs.clone(),
-        repo_path: stdout_is_a_pty
-            .then(|| std::env::current_dir().log_err())
-            .flatten(),
-        cx,
-    }))
-    .log_err()
-    .map(Arc::new)
-    .unwrap_or_else(|| Arc::new(prompts::PromptBuilder::new(None).unwrap()));
-    register_slash_commands(Some(prompt_builder.clone()), cx);
+    register_slash_commands(cx);
     inline_assistant::init(
         fs.clone(),
         prompt_builder.clone(),
@@ -240,7 +121,7 @@ pub fn init(
         client.telemetry().clone(),
         cx,
     );
-    IndexedDocsRegistry::init_global(cx);
+    indexed_docs::init(cx);
 
     CommandPaletteFilter::update_global(cx, |filter, _cx| {
         filter.hide_namespace(Assistant::NAMESPACE);
@@ -257,71 +138,9 @@ pub fn init(
         });
     })
     .detach();
-
-    register_context_server_handlers(cx);
-
-    prompt_builder
 }
 
-fn register_context_server_handlers(cx: &mut AppContext) {
-    cx.subscribe(
-        &context_servers::manager::ContextServerManager::global(cx),
-        |manager, event, cx| match event {
-            context_servers::manager::Event::ServerStarted { server_id } => {
-                cx.update_model(
-                    &manager,
-                    |manager: &mut context_servers::manager::ContextServerManager, cx| {
-                        let slash_command_registry = SlashCommandRegistry::global(cx);
-                        let context_server_registry = ContextServerRegistry::global(cx);
-                        if let Some(server) = manager.get_server(server_id) {
-                            cx.spawn(|_, _| async move {
-                                let Some(protocol) = server.client.read().clone() else {
-                                    return;
-                                };
-
-                                if let Some(prompts) = protocol.list_prompts().await.log_err() {
-                                    for prompt in prompts
-                                        .into_iter()
-                                        .filter(context_server_command::acceptable_prompt)
-                                    {
-                                        log::info!(
-                                            "registering context server command: {:?}",
-                                            prompt.name
-                                        );
-                                        context_server_registry.register_command(
-                                            server.id.clone(),
-                                            prompt.name.as_str(),
-                                        );
-                                        slash_command_registry.register_command(
-                                            context_server_command::ContextServerSlashCommand::new(
-                                                &server, prompt,
-                                            ),
-                                            true,
-                                        );
-                                    }
-                                }
-                            })
-                            .detach();
-                        }
-                    },
-                );
-            }
-            context_servers::manager::Event::ServerStopped { server_id } => {
-                let slash_command_registry = SlashCommandRegistry::global(cx);
-                let context_server_registry = ContextServerRegistry::global(cx);
-                if let Some(commands) = context_server_registry.get_commands(server_id) {
-                    for command_name in commands {
-                        slash_command_registry.unregister_command_by_name(&command_name);
-                        context_server_registry.unregister_command(&server_id, &command_name);
-                    }
-                }
-            }
-        },
-    )
-    .detach();
-}
-
-fn init_language_model_settings(cx: &mut AppContext) {
+fn init_language_model_settings(cx: &mut App) {
     update_active_language_model_from_settings(cx);
 
     cx.observe_global::<SettingsStore>(update_active_language_model_from_settings)
@@ -340,82 +159,129 @@ fn init_language_model_settings(cx: &mut AppContext) {
     .detach();
 }
 
-fn update_active_language_model_from_settings(cx: &mut AppContext) {
+fn update_active_language_model_from_settings(cx: &mut App) {
     let settings = AssistantSettings::get_global(cx);
-    let provider_name = LanguageModelProviderId::from(settings.default_model.provider.clone());
-    let model_id = LanguageModelId::from(settings.default_model.model.clone());
+    // Default model - used as fallback
+    let active_model_provider_name =
+        LanguageModelProviderId::from(settings.default_model.provider.clone());
+    let active_model_id = LanguageModelId::from(settings.default_model.model.clone());
+
+    // Inline assistant model
+    let inline_assistant_model = settings
+        .inline_assistant_model
+        .as_ref()
+        .unwrap_or(&settings.default_model);
+    let inline_assistant_provider_name =
+        LanguageModelProviderId::from(inline_assistant_model.provider.clone());
+    let inline_assistant_model_id = LanguageModelId::from(inline_assistant_model.model.clone());
+
+    // Commit message model
+    let commit_message_model = settings
+        .commit_message_model
+        .as_ref()
+        .unwrap_or(&settings.default_model);
+    let commit_message_provider_name =
+        LanguageModelProviderId::from(commit_message_model.provider.clone());
+    let commit_message_model_id = LanguageModelId::from(commit_message_model.model.clone());
+
+    // Thread summary model
+    let thread_summary_model = settings
+        .thread_summary_model
+        .as_ref()
+        .unwrap_or(&settings.default_model);
+    let thread_summary_provider_name =
+        LanguageModelProviderId::from(thread_summary_model.provider.clone());
+    let thread_summary_model_id = LanguageModelId::from(thread_summary_model.model.clone());
+
+    let inline_alternatives = settings
+        .inline_alternatives
+        .iter()
+        .map(|alternative| {
+            (
+                LanguageModelProviderId::from(alternative.provider.clone()),
+                LanguageModelId::from(alternative.model.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+
     LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-        registry.select_active_model(&provider_name, &model_id, cx);
+        // Set the default model
+        registry.select_default_model(&active_model_provider_name, &active_model_id, cx);
+
+        // Set the specific models
+        registry.select_inline_assistant_model(
+            &inline_assistant_provider_name,
+            &inline_assistant_model_id,
+            cx,
+        );
+        registry.select_commit_message_model(
+            &commit_message_provider_name,
+            &commit_message_model_id,
+            cx,
+        );
+        registry.select_thread_summary_model(
+            &thread_summary_provider_name,
+            &thread_summary_model_id,
+            cx,
+        );
+
+        // Set the alternatives
+        registry.select_inline_alternative_models(inline_alternatives, cx);
     });
 }
 
-fn register_slash_commands(prompt_builder: Option<Arc<PromptBuilder>>, cx: &mut AppContext) {
+fn register_slash_commands(cx: &mut App) {
     let slash_command_registry = SlashCommandRegistry::global(cx);
-    slash_command_registry.register_command(file_command::FileSlashCommand, true);
-    slash_command_registry.register_command(symbols_command::OutlineSlashCommand, true);
-    slash_command_registry.register_command(tab_command::TabSlashCommand, true);
-    slash_command_registry.register_command(project_command::ProjectSlashCommand, true);
-    slash_command_registry.register_command(prompt_command::PromptSlashCommand, true);
-    slash_command_registry.register_command(default_command::DefaultSlashCommand, false);
-    slash_command_registry.register_command(terminal_command::TerminalSlashCommand, true);
-    slash_command_registry.register_command(now_command::NowSlashCommand, false);
-    slash_command_registry.register_command(diagnostics_command::DiagnosticsSlashCommand, true);
 
-    if let Some(prompt_builder) = prompt_builder {
-        slash_command_registry.register_command(
-            workflow_command::WorkflowSlashCommand::new(prompt_builder.clone()),
-            true,
-        );
-    }
-    slash_command_registry.register_command(fetch_command::FetchSlashCommand, false);
+    slash_command_registry.register_command(assistant_slash_commands::FileSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::DeltaSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::OutlineSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::TabSlashCommand, true);
+    slash_command_registry
+        .register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::PromptSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::SelectionCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::DefaultSlashCommand, false);
+    slash_command_registry.register_command(assistant_slash_commands::TerminalSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::NowSlashCommand, false);
+    slash_command_registry
+        .register_command(assistant_slash_commands::DiagnosticsSlashCommand, true);
+    slash_command_registry.register_command(assistant_slash_commands::FetchSlashCommand, true);
 
-    update_slash_commands_from_settings(cx);
-    cx.observe_global::<SettingsStore>(update_slash_commands_from_settings)
-        .detach();
-
-    cx.observe_flag::<search_command::SearchSlashCommandFeatureFlag, _>({
+    cx.observe_flag::<assistant_slash_commands::StreamingExampleSlashCommandFeatureFlag, _>({
         let slash_command_registry = slash_command_registry.clone();
         move |is_enabled, _cx| {
             if is_enabled {
-                slash_command_registry.register_command(search_command::SearchSlashCommand, true);
+                slash_command_registry.register_command(
+                    assistant_slash_commands::StreamingExampleSlashCommand,
+                    false,
+                );
             }
         }
     })
     .detach();
+
+    update_slash_commands_from_settings(cx);
+    cx.observe_global::<SettingsStore>(update_slash_commands_from_settings)
+        .detach();
 }
 
-fn update_slash_commands_from_settings(cx: &mut AppContext) {
+fn update_slash_commands_from_settings(cx: &mut App) {
     let slash_command_registry = SlashCommandRegistry::global(cx);
     let settings = SlashCommandSettings::get_global(cx);
 
     if settings.docs.enabled {
-        slash_command_registry.register_command(docs_command::DocsSlashCommand, true);
+        slash_command_registry.register_command(assistant_slash_commands::DocsSlashCommand, true);
     } else {
-        slash_command_registry.unregister_command(docs_command::DocsSlashCommand);
+        slash_command_registry.unregister_command(assistant_slash_commands::DocsSlashCommand);
     }
 
-    if settings.project.enabled {
-        slash_command_registry.register_command(project_command::ProjectSlashCommand, true);
+    if settings.cargo_workspace.enabled {
+        slash_command_registry
+            .register_command(assistant_slash_commands::CargoWorkspaceSlashCommand, true);
     } else {
-        slash_command_registry.unregister_command(project_command::ProjectSlashCommand);
-    }
-}
-
-pub fn humanize_token_count(count: usize) -> String {
-    match count {
-        0..=999 => count.to_string(),
-        1000..=9999 => {
-            let thousands = count / 1000;
-            let hundreds = (count % 1000 + 50) / 100;
-            if hundreds == 0 {
-                format!("{}k", thousands)
-            } else if hundreds == 10 {
-                format!("{}k", thousands + 1)
-            } else {
-                format!("{}.{}k", thousands, hundreds)
-            }
-        }
-        _ => format!("{}k", (count + 500) / 1000),
+        slash_command_registry
+            .unregister_command(assistant_slash_commands::CargoWorkspaceSlashCommand);
     }
 }
 

@@ -5,6 +5,11 @@ use std::sync::OnceLock;
 
 pub use util::paths::home_dir;
 
+/// Returns the relative path to the zed_server directory on the ssh host.
+pub fn remote_server_dir_relative() -> &'static Path {
+    Path::new(".zed_server")
+}
+
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -15,7 +20,7 @@ pub fn config_dir() -> &'static PathBuf {
                 .join("Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_config) = std::env::var("FLATPAK_XDG_CONFIG_HOME") {
                 flatpak_xdg_config.into()
             } else {
@@ -36,7 +41,7 @@ pub fn support_dir() -> &'static PathBuf {
             return home_dir().join("Library/Application Support/Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
                 flatpak_xdg_data.into()
             } else {
@@ -59,13 +64,19 @@ pub fn support_dir() -> &'static PathBuf {
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
     TEMP_DIR.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            return dirs::cache_dir()
+                .expect("failed to determine cachesDirectory directory")
+                .join("Zed");
+        }
+
         if cfg!(target_os = "windows") {
             return dirs::cache_dir()
                 .expect("failed to determine LocalAppData directory")
                 .join("Zed");
         }
 
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
                 flatpak_xdg_cache.into()
             } else {
@@ -88,6 +99,12 @@ pub fn logs_dir() -> &'static PathBuf {
             support_dir().join("logs")
         }
     })
+}
+
+/// Returns the path to the Zed server directory on this SSH host.
+pub fn remote_server_state_dir() -> &'static PathBuf {
+    static REMOTE_SERVER_STATE: OnceLock<PathBuf> = OnceLock::new();
+    REMOTE_SERVER_STATE.get_or_init(|| support_dir().join("server_state"))
 }
 
 /// Returns the path to the `Zed.log` file.
@@ -128,16 +145,34 @@ pub fn settings_file() -> &'static PathBuf {
     SETTINGS_FILE.get_or_init(|| config_dir().join("settings.json"))
 }
 
+/// Returns the path to the `settings_backup.json` file.
+pub fn settings_backup_file() -> &'static PathBuf {
+    static SETTINGS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    SETTINGS_FILE.get_or_init(|| config_dir().join("settings_backup.json"))
+}
+
 /// Returns the path to the `keymap.json` file.
 pub fn keymap_file() -> &'static PathBuf {
     static KEYMAP_FILE: OnceLock<PathBuf> = OnceLock::new();
     KEYMAP_FILE.get_or_init(|| config_dir().join("keymap.json"))
 }
 
+/// Returns the path to the `keymap_backup.json` file.
+pub fn keymap_backup_file() -> &'static PathBuf {
+    static KEYMAP_FILE: OnceLock<PathBuf> = OnceLock::new();
+    KEYMAP_FILE.get_or_init(|| config_dir().join("keymap_backup.json"))
+}
+
 /// Returns the path to the `tasks.json` file.
 pub fn tasks_file() -> &'static PathBuf {
     static TASKS_FILE: OnceLock<PathBuf> = OnceLock::new();
     TASKS_FILE.get_or_init(|| config_dir().join("tasks.json"))
+}
+
+/// Returns the path to the `debug.json` file.
+pub fn debug_tasks_file() -> &'static PathBuf {
+    static DEBUG_TASKS_FILE: OnceLock<PathBuf> = OnceLock::new();
+    DEBUG_TASKS_FILE.get_or_init(|| config_dir().join("debug.json"))
 }
 
 /// Returns the path to the extensions directory.
@@ -148,12 +183,34 @@ pub fn extensions_dir() -> &'static PathBuf {
     EXTENSIONS_DIR.get_or_init(|| support_dir().join("extensions"))
 }
 
+/// Returns the path to the extensions directory.
+///
+/// This is where installed extensions are stored on a remote.
+pub fn remote_extensions_dir() -> &'static PathBuf {
+    static EXTENSIONS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    EXTENSIONS_DIR.get_or_init(|| support_dir().join("remote_extensions"))
+}
+
+/// Returns the path to the extensions directory.
+///
+/// This is where installed extensions are stored on a remote.
+pub fn remote_extensions_uploads_dir() -> &'static PathBuf {
+    static UPLOAD_DIR: OnceLock<PathBuf> = OnceLock::new();
+    UPLOAD_DIR.get_or_init(|| remote_extensions_dir().join("uploads"))
+}
+
 /// Returns the path to the themes directory.
 ///
 /// This is where themes that are not provided by extensions are stored.
 pub fn themes_dir() -> &'static PathBuf {
     static THEMES_DIR: OnceLock<PathBuf> = OnceLock::new();
     THEMES_DIR.get_or_init(|| config_dir().join("themes"))
+}
+
+/// Returns the path to the snippets directory.
+pub fn snippets_dir() -> &'static PathBuf {
+    static SNIPPETS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    SNIPPETS_DIR.get_or_init(|| config_dir().join("snippets"))
 }
 
 /// Returns the path to the contexts directory.
@@ -168,12 +225,6 @@ pub fn contexts_dir() -> &'static PathBuf {
             support_dir().join("conversations")
         }
     })
-}
-
-/// Returns the path within the contexts directory where images from contexts are stored.
-pub fn context_images_dir() -> &'static PathBuf {
-    static CONTEXT_IMAGES_DIR: OnceLock<PathBuf> = OnceLock::new();
-    CONTEXT_IMAGES_DIR.get_or_init(|| contexts_dir().join("images"))
 }
 
 /// Returns the path to the contexts directory.
@@ -239,6 +290,14 @@ pub fn languages_dir() -> &'static PathBuf {
     LANGUAGES_DIR.get_or_init(|| support_dir().join("languages"))
 }
 
+/// Returns the path to the debug adapters directory
+///
+/// This is where debug adapters are downloaded to for DAPs that are built-in to Zed.
+pub fn debug_adapters_dir() -> &'static PathBuf {
+    static DEBUG_ADAPTERS_DIR: OnceLock<PathBuf> = OnceLock::new();
+    DEBUG_ADAPTERS_DIR.get_or_init(|| support_dir().join("debug_adapters"))
+}
+
 /// Returns the path to the Copilot directory.
 pub fn copilot_dir() -> &'static PathBuf {
     static COPILOT_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -282,3 +341,24 @@ pub fn local_tasks_file_relative_path() -> &'static Path {
 pub fn local_vscode_tasks_file_relative_path() -> &'static Path {
     Path::new(".vscode/tasks.json")
 }
+
+pub fn debug_task_file_name() -> &'static str {
+    "debug.json"
+}
+
+pub fn task_file_name() -> &'static str {
+    "tasks.json"
+}
+
+/// Returns the relative path to a `launch.json` file within a project.
+pub fn local_debug_file_relative_path() -> &'static Path {
+    Path::new(".zed/debug.json")
+}
+
+/// Returns the relative path to a `.vscode/launch.json` file within a project.
+pub fn local_vscode_launch_file_relative_path() -> &'static Path {
+    Path::new(".vscode/launch.json")
+}
+
+/// A default editorconfig file name to use when resolving project settings.
+pub const EDITORCONFIG_NAME: &str = ".editorconfig";

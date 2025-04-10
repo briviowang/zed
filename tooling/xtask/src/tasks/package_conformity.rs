@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context as _, Result, anyhow};
 use cargo_toml::{Dependency, Manifest};
 use clap::Parser;
 
@@ -71,7 +71,7 @@ pub fn run_package_conformity(_args: PackageConformityArgs) -> Result<()> {
 /// Returns the contents of the `Cargo.toml` file at the given path.
 fn read_cargo_toml(path: impl AsRef<Path>) -> Result<Manifest> {
     let path = path.as_ref();
-    let cargo_toml_bytes = fs::read(&path)?;
+    let cargo_toml_bytes = fs::read(path)?;
     Manifest::from_slice(&cargo_toml_bytes)
         .with_context(|| anyhow!("failed to read Cargo.toml at {path:?}"))
 }

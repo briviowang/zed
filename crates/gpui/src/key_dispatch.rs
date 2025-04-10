@@ -9,14 +9,14 @@
 /// actions!(editor,[Undo, Redo]);;
 ///
 /// impl Editor {
-///   fn undo(&mut self, _: &Undo, _cx: &mut ViewContext<Self>) { ... }
-///   fn redo(&mut self, _: &Redo, _cx: &mut ViewContext<Self>) { ... }
+///   fn undo(&mut self, _: &Undo, _window: &mut Window, _cx: &mut Context<Self>) { ... }
+///   fn redo(&mut self, _: &Redo, _window: &mut Window, _cx: &mut Context<Self>) { ... }
 /// }
 ///
 /// impl Render for Editor {
-///   fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+///   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
 ///     div()
-///       .track_focus(&self.focus_handle)
+///       .track_focus(&self.focus_handle(cx))
 ///       .keymap_context("Editor")
 ///       .on_action(cx.listener(Editor::undo))
 ///       .on_action(cx.listener(Editor::redo))
@@ -50,8 +50,8 @@
 ///  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
 ///
 use crate::{
-    Action, ActionRegistry, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
-    Keystroke, ModifiersChangedEvent, WindowContext,
+    Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
+    Keystroke, ModifiersChangedEvent, Window,
 };
 use collections::FxHashMap;
 use smallvec::SmallVec;
@@ -123,13 +123,13 @@ pub(crate) struct DispatchResult {
     pub(crate) to_replay: SmallVec<[Replay; 1]>,
 }
 
-type KeyListener = Rc<dyn Fn(&dyn Any, DispatchPhase, &mut WindowContext)>;
-type ModifiersChangedListener = Rc<dyn Fn(&ModifiersChangedEvent, &mut WindowContext)>;
+type KeyListener = Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>;
+type ModifiersChangedListener = Rc<dyn Fn(&ModifiersChangedEvent, &mut Window, &mut App)>;
 
 #[derive(Clone)]
 pub(crate) struct DispatchActionListener {
     pub(crate) action_type: TypeId,
-    pub(crate) listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut WindowContext)>,
+    pub(crate) listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
 }
 
 impl DispatchTree {
@@ -217,10 +217,6 @@ impl DispatchTree {
         let node_id = *self.node_stack.last().unwrap();
         self.nodes[node_id.0].focus_id = Some(focus_id);
         self.focusable_node_ids.insert(focus_id, node_id);
-    }
-
-    pub fn parent_view_id(&mut self) -> Option<EntityId> {
-        self.view_stack.last().copied()
     }
 
     pub fn set_view_id(&mut self, view_id: EntityId) {
@@ -333,7 +329,7 @@ impl DispatchTree {
     pub fn on_action(
         &mut self,
         action_type: TypeId,
-        listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut WindowContext)>,
+        listener: Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Window, &mut App)>,
     ) {
         self.active_node()
             .action_listeners
@@ -393,6 +389,8 @@ impl DispatchTree {
         false
     }
 
+    /// Returns key bindings that invoke an action on the currently focused element. Bindings are
+    /// returned in the order they were added. For display, the last binding should take precedence.
     pub fn bindings_for_action(
         &self,
         action: &dyn Action,
@@ -402,11 +400,8 @@ impl DispatchTree {
         keymap
             .bindings_for_action(action)
             .filter(|binding| {
-                let (bindings, _) = keymap.bindings_for_input(&binding.keystrokes, &context_stack);
-                bindings
-                    .iter()
-                    .next()
-                    .is_some_and(|b| b.action.partial_eq(action))
+                let (bindings, _) = keymap.bindings_for_input(&binding.keystrokes, context_stack);
+                bindings.iter().any(|b| b.action.partial_eq(action))
             })
             .cloned()
             .collect()
@@ -424,7 +419,7 @@ impl DispatchTree {
 
         self.keymap
             .borrow()
-            .bindings_for_input(&input, &context_stack)
+            .bindings_for_input(input, &context_stack)
     }
 
     /// dispatch_key processes the keystroke
@@ -463,7 +458,7 @@ impl DispatchTree {
         let mut result = self.dispatch_key(suffix, keystroke, dispatch_path);
         to_replay.extend(result.to_replay);
         result.to_replay = to_replay;
-        return result;
+        result
     }
 
     /// If the user types a matching prefix of a binding and then waits for a timeout
@@ -475,7 +470,7 @@ impl DispatchTree {
     ) -> SmallVec<[Replay; 1]> {
         let (suffix, mut to_replay) = self.replay_prefix(input, dispatch_path);
 
-        if suffix.len() > 0 {
+        if !suffix.is_empty() {
             to_replay.extend(self.flush_dispatch(suffix, dispatch_path))
         }
 
@@ -484,7 +479,7 @@ impl DispatchTree {
 
     /// Converts the longest prefix of input to a replay event and returns the rest.
     fn replay_prefix(
-        &mut self,
+        &self,
         mut input: SmallVec<[Keystroke; 1]>,
         dispatch_path: &SmallVec<[DispatchNodeId; 32]>,
     ) -> (SmallVec<[Keystroke; 1]>, SmallVec<[Replay; 1]>) {
@@ -493,7 +488,7 @@ impl DispatchTree {
             let (bindings, _) = self.bindings_for_input(&input[0..=last], dispatch_path);
             if !bindings.is_empty() {
                 to_replay.push(Replay {
-                    keystroke: input.drain(0..=last).last().unwrap(),
+                    keystroke: input.drain(0..=last).next_back().unwrap(),
                     bindings,
                 });
                 break;
@@ -600,10 +595,6 @@ mod tests {
 
         fn boxed_clone(&self) -> std::boxed::Box<dyn Action> {
             Box::new(TestAction)
-        }
-
-        fn as_any(&self) -> &dyn ::std::any::Any {
-            self
         }
 
         fn build(_value: serde_json::Value) -> anyhow::Result<Box<dyn Action>>

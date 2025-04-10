@@ -1,42 +1,47 @@
 use crate::{
-    motion::{self, Motion},
+    Vim,
+    motion::{self, Motion, MotionKind},
     object::Object,
     state::Mode,
-    Vim,
 };
 use editor::{
+    Bias, DisplayPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement::TextLayoutDetails,
     scroll::Autoscroll,
-    Bias, DisplayPoint,
 };
+use gpui::{Context, Window};
 use language::Selection;
-use ui::ViewContext;
 
 impl Vim {
     pub fn change_motion(
         &mut self,
         motion: Motion,
         times: Option<usize>,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         // Some motions ignore failure when switching to normal mode
-        let mut motion_succeeded = matches!(
+        let mut motion_kind = if matches!(
             motion,
             Motion::Left
                 | Motion::Right
                 | Motion::EndOfLine { .. }
-                | Motion::Backspace
+                | Motion::WrappingLeft
                 | Motion::StartOfLine { .. }
-        );
-        self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(cx);
-            editor.transact(cx, |editor, cx| {
+        ) {
+            Some(MotionKind::Exclusive)
+        } else {
+            None
+        };
+        self.update_editor(window, cx, |vim, editor, window, cx| {
+            let text_layout_details = editor.text_layout_details(window);
+            editor.transact(window, cx, |editor, window, cx| {
                 // We are swapping to insert mode anyway. Just set the line end clipping behavior now
                 editor.set_clip_at_line_ends(false, cx);
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                     s.move_with(|map, selection| {
-                        motion_succeeded |= match motion {
+                        let kind = match motion {
                             Motion::NextWordStart { ignore_punctuation }
                             | Motion::NextSubwordStart { ignore_punctuation } => {
                                 expand_changed_word_selection(
@@ -49,11 +54,10 @@ impl Vim {
                                 )
                             }
                             _ => {
-                                let result = motion.expand_selection(
+                                let kind = motion.expand_selection(
                                     map,
                                     selection,
                                     times,
-                                    false,
                                     &text_layout_details,
                                 );
                                 if let Motion::CurrentLine = motion {
@@ -61,7 +65,7 @@ impl Vim {
                                         selection.start.to_offset(map, Bias::Left);
                                     let classifier = map
                                         .buffer_snapshot
-                                        .char_classifier_at(selection.start.to_point(&map));
+                                        .char_classifier_at(selection.start.to_point(map));
                                     for (ch, offset) in map.buffer_chars_at(start_offset) {
                                         if ch == '\n' || !classifier.is_whitespace(ch) {
                                             break;
@@ -70,45 +74,58 @@ impl Vim {
                                     }
                                     selection.start = start_offset.to_display_point(map);
                                 }
-                                result
+                                kind
                             }
+                        };
+                        if let Some(kind) = kind {
+                            motion_kind.get_or_insert(kind);
                         }
                     });
                 });
-                vim.copy_selections_content(editor, motion.linewise(), cx);
-                editor.insert("", cx);
+                if let Some(kind) = motion_kind {
+                    vim.copy_selections_content(editor, kind, window, cx);
+                    editor.insert("", window, cx);
+                    editor.refresh_inline_completion(true, false, window, cx);
+                }
             });
         });
 
-        if motion_succeeded {
-            self.switch_mode(Mode::Insert, false, cx)
+        if motion_kind.is_some() {
+            self.switch_mode(Mode::Insert, false, window, cx)
         } else {
-            self.switch_mode(Mode::Normal, false, cx)
+            self.switch_mode(Mode::Normal, false, window, cx)
         }
     }
 
-    pub fn change_object(&mut self, object: Object, around: bool, cx: &mut ViewContext<Self>) {
+    pub fn change_object(
+        &mut self,
+        object: Object,
+        around: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut objects_found = false;
-        self.update_editor(cx, |vim, editor, cx| {
+        self.update_editor(window, cx, |vim, editor, window, cx| {
             // We are swapping to insert mode anyway. Just set the line end clipping behavior now
             editor.set_clip_at_line_ends(false, cx);
-            editor.transact(cx, |editor, cx| {
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+            editor.transact(window, cx, |editor, window, cx| {
+                editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                     s.move_with(|map, selection| {
                         objects_found |= object.expand_selection(map, selection, around);
                     });
                 });
                 if objects_found {
-                    vim.copy_selections_content(editor, false, cx);
-                    editor.insert("", cx);
+                    vim.copy_selections_content(editor, MotionKind::Exclusive, window, cx);
+                    editor.insert("", window, cx);
+                    editor.refresh_inline_completion(true, false, window, cx);
                 }
             });
         });
 
         if objects_found {
-            self.switch_mode(Mode::Insert, false, cx);
+            self.switch_mode(Mode::Insert, false, window, cx);
         } else {
-            self.switch_mode(Mode::Normal, false, cx);
+            self.switch_mode(Mode::Normal, false, window, cx);
         }
     }
 }
@@ -126,7 +143,7 @@ fn expand_changed_word_selection(
     ignore_punctuation: bool,
     text_layout_details: &TextLayoutDetails,
     use_subword: bool,
-) -> bool {
+) -> Option<MotionKind> {
     let is_in_word = || {
         let classifier = map
             .buffer_snapshot
@@ -136,7 +153,7 @@ fn expand_changed_word_selection(
             .next()
             .map(|(c, _)| !classifier.is_whitespace(c))
             .unwrap_or_default();
-        return in_word;
+        in_word
     };
     if (times.is_none() || times.unwrap() == 1) && is_in_word() {
         let next_char = map
@@ -157,14 +174,14 @@ fn expand_changed_word_selection(
                 selection.end = motion::next_char(map, selection.end, false);
             }
         }
-        true
+        Some(MotionKind::Inclusive)
     } else {
         let motion = if use_subword {
             Motion::NextSubwordStart { ignore_punctuation }
         } else {
             Motion::NextWordStart { ignore_punctuation }
         };
-        motion.expand_selection(map, selection, times, false, &text_layout_details)
+        motion.expand_selection(map, selection, times, text_layout_details)
     }
 }
 

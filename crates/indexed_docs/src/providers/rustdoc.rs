@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use collections::{HashSet, VecDeque};
 use fs::Fs;
@@ -209,9 +209,12 @@ impl IndexedDocsProvider for DocsDotRsProvider {
 async fn index_rustdoc(
     package: PackageName,
     database: Arc<IndexedDocsDatabase>,
-    fetch_page: impl Fn(&PackageName, Option<&RustdocItem>) -> BoxFuture<'static, Result<Option<String>>>
-        + Send
-        + Sync,
+    fetch_page: impl Fn(
+        &PackageName,
+        Option<&RustdocItem>,
+    ) -> BoxFuture<'static, Result<Option<String>>>
+    + Send
+    + Sync,
 ) -> Result<()> {
     let Some(package_root_content) = fetch_page(&package, None).await? else {
         return Ok(());
@@ -235,7 +238,7 @@ async fn index_rustdoc(
     while let Some(item_with_history) = items_to_visit.pop_front() {
         let item = &item_with_history.item;
 
-        let Some(result) = fetch_page(&package, Some(&item)).await.with_context(|| {
+        let Some(result) = fetch_page(&package, Some(item)).await.with_context(|| {
             #[cfg(debug_assertions)]
             {
                 format!(
@@ -268,11 +271,8 @@ async fn index_rustdoc(
             seen_items.insert(item.clone());
 
             item.path.extend(parent_item.path.clone());
-            match parent_item.kind {
-                RustdocItemKind::Mod => {
-                    item.path.push(parent_item.name.clone());
-                }
-                _ => {}
+            if parent_item.kind == RustdocItemKind::Mod {
+                item.path.push(parent_item.name.clone());
             }
 
             items_to_visit.push_back(RustdocItemWithHistory {

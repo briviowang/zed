@@ -1,6 +1,6 @@
+use crate::HandleTag;
 use crate::html_element::HtmlElement;
 use crate::markdown_writer::{HandlerOutcome, MarkdownWriter, StartTagOutcome};
-use crate::HandleTag;
 
 pub struct WikipediaChromeRemover;
 
@@ -54,13 +54,8 @@ impl HandleTag for WikipediaInfoboxHandler {
         tag: &HtmlElement,
         _writer: &mut MarkdownWriter,
     ) -> StartTagOutcome {
-        match tag.tag() {
-            "table" => {
-                if tag.has_class("infobox") {
-                    return StartTagOutcome::Skip;
-                }
-            }
-            _ => {}
+        if tag.tag() == "table" && tag.has_class("infobox") {
+            return StartTagOutcome::Skip;
         }
 
         StartTagOutcome::Continue
@@ -77,12 +72,15 @@ impl WikipediaCodeHandler {
     }
 }
 
+impl Default for WikipediaCodeHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HandleTag for WikipediaCodeHandler {
     fn should_handle(&self, tag: &str) -> bool {
-        match tag {
-            "div" | "pre" | "code" => true,
-            _ => false,
-        }
+        matches!(tag, "div" | "pre" | "code")
     }
 
     fn handle_tag_start(
@@ -134,7 +132,7 @@ impl HandleTag for WikipediaCodeHandler {
 
     fn handle_text(&mut self, text: &str, writer: &mut MarkdownWriter) -> HandlerOutcome {
         if writer.is_inside("pre") {
-            writer.push_str(&text);
+            writer.push_str(text);
             return HandlerOutcome::Handled;
         }
 
@@ -150,7 +148,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::{convert_html_to_markdown, markdown, TagHandler};
+    use crate::{TagHandler, convert_html_to_markdown, markdown};
 
     use super::*;
 

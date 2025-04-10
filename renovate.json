@@ -14,11 +14,12 @@
     "dependencyDashboardApproval": true
   },
   "prFooter": "Release Notes:\n\n- N/A",
+  "ignorePaths": ["**/node_modules/**", "tooling/workspace-hack/**"],
   "packageRules": [
     {
       "description": "Group wasmtime crates together.",
-      "matchPackagePrefixes": ["wasmtime"],
-      "groupName": "wasmtime"
+      "groupName": "wasmtime",
+      "matchPackageNames": ["wasmtime{/,}**"]
     }
   ]
 }

@@ -24,19 +24,21 @@ pub fn format_localized_timestamp(
 ) -> String {
     let timestamp_local = timestamp.to_offset(timezone);
     let reference_local = reference.to_offset(timezone);
+    format_local_timestamp(timestamp_local, reference_local, format)
+}
 
+/// Formats a timestamp, which respects the user's date and time preferences/custom format.
+pub fn format_local_timestamp(
+    timestamp: OffsetDateTime,
+    reference: OffsetDateTime,
+    format: TimestampFormat,
+) -> String {
     match format {
-        TimestampFormat::Absolute => {
-            format_absolute_timestamp(timestamp_local, reference_local, false)
-        }
-        TimestampFormat::EnhancedAbsolute => {
-            format_absolute_timestamp(timestamp_local, reference_local, true)
-        }
-        TimestampFormat::MediumAbsolute => {
-            format_absolute_timestamp_medium(timestamp_local, reference_local)
-        }
-        TimestampFormat::Relative => format_relative_time(timestamp_local, reference_local)
-            .unwrap_or_else(|| format_relative_date(timestamp_local, reference_local)),
+        TimestampFormat::Absolute => format_absolute_timestamp(timestamp, reference, false),
+        TimestampFormat::EnhancedAbsolute => format_absolute_timestamp(timestamp, reference, true),
+        TimestampFormat::MediumAbsolute => format_absolute_timestamp_medium(timestamp, reference),
+        TimestampFormat::Relative => format_relative_time(timestamp, reference)
+            .unwrap_or_else(|| format_relative_date(timestamp, reference)),
     }
 }
 
@@ -163,14 +165,12 @@ fn calculate_month_difference(timestamp: OffsetDateTime, reference: OffsetDateTi
     let year_diff = (reference_year - timestamp_year) as usize;
     if year_diff == 0 {
         reference_month as usize - timestamp_month as usize
+    } else if month_diff == 0 {
+        year_diff * 12
+    } else if timestamp_month > reference_month {
+        (year_diff - 1) * 12 + month_diff
     } else {
-        if month_diff == 0 {
-            year_diff * 12
-        } else if timestamp_month > reference_month {
-            (year_diff - 1) * 12 + month_diff
-        } else {
-            year_diff * 12 + month_diff
-        }
+        year_diff * 12 + month_diff
     }
 }
 
@@ -274,8 +274,8 @@ mod macos {
     use core_foundation_sys::{
         base::kCFAllocatorDefault,
         date_formatter::{
-            kCFDateFormatterMediumStyle, kCFDateFormatterNoStyle, kCFDateFormatterShortStyle,
-            CFDateFormatterCreate,
+            CFDateFormatterCreate, kCFDateFormatterMediumStyle, kCFDateFormatterNoStyle,
+            kCFDateFormatterShortStyle,
         },
         locale::CFLocaleCopyCurrent,
     };

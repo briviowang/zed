@@ -1,6 +1,6 @@
 use crate::Result;
 use rpc::proto;
-use sea_orm::{entity::prelude::*, DbErr};
+use sea_orm::{DbErr, entity::prelude::*};
 use serde::{Deserialize, Serialize};
 
 #[macro_export]
@@ -32,6 +32,7 @@ macro_rules! id_type {
             #[allow(unused)]
             #[allow(missing_docs)]
             pub fn from_proto(value: u64) -> Self {
+                debug_assert!(value != 0);
                 Self(value as i32)
             }
 
@@ -71,13 +72,13 @@ macro_rules! id_type {
 id_type!(AccessTokenId);
 id_type!(BillingCustomerId);
 id_type!(BillingSubscriptionId);
+id_type!(BillingPreferencesId);
 id_type!(BufferId);
 id_type!(ChannelBufferCollaboratorId);
 id_type!(ChannelChatParticipantId);
 id_type!(ChannelId);
 id_type!(ChannelMemberId);
 id_type!(ContactId);
-id_type!(DevServerId);
 id_type!(ExtensionId);
 id_type!(FlagId);
 id_type!(FollowerId);
@@ -87,7 +88,6 @@ id_type!(NotificationId);
 id_type!(NotificationKindId);
 id_type!(ProjectCollaboratorId);
 id_type!(ProjectId);
-id_type!(DevServerProjectId);
 id_type!(ReplicaId);
 id_type!(RoomId);
 id_type!(RoomParticipantId);
@@ -104,7 +104,7 @@ pub enum ChannelRole {
     /// Admin can read/write and change permissions.
     #[sea_orm(string_value = "admin")]
     Admin,
-    /// Member can read/write, but not change pemissions.
+    /// Member can read/write, but not change permissions.
     #[sea_orm(string_value = "member")]
     #[default]
     Member,
@@ -218,9 +218,9 @@ impl From<proto::ChannelRole> for ChannelRole {
     }
 }
 
-impl Into<proto::ChannelRole> for ChannelRole {
-    fn into(self) -> proto::ChannelRole {
-        match self {
+impl From<ChannelRole> for proto::ChannelRole {
+    fn from(val: ChannelRole) -> Self {
+        match val {
             ChannelRole::Admin => proto::ChannelRole::Admin,
             ChannelRole::Member => proto::ChannelRole::Member,
             ChannelRole::Talker => proto::ChannelRole::Talker,
@@ -230,9 +230,9 @@ impl Into<proto::ChannelRole> for ChannelRole {
     }
 }
 
-impl Into<i32> for ChannelRole {
-    fn into(self) -> i32 {
-        let proto: proto::ChannelRole = self.into();
+impl From<ChannelRole> for i32 {
+    fn from(val: ChannelRole) -> Self {
+        let proto: proto::ChannelRole = val.into();
         proto.into()
     }
 }
@@ -259,26 +259,20 @@ impl From<proto::ChannelVisibility> for ChannelVisibility {
     }
 }
 
-impl Into<proto::ChannelVisibility> for ChannelVisibility {
-    fn into(self) -> proto::ChannelVisibility {
-        match self {
+impl From<ChannelVisibility> for proto::ChannelVisibility {
+    fn from(val: ChannelVisibility) -> Self {
+        match val {
             ChannelVisibility::Public => proto::ChannelVisibility::Public,
             ChannelVisibility::Members => proto::ChannelVisibility::Members,
         }
     }
 }
 
-impl Into<i32> for ChannelVisibility {
-    fn into(self) -> i32 {
-        let proto: proto::ChannelVisibility = self.into();
+impl From<ChannelVisibility> for i32 {
+    fn from(val: ChannelVisibility) -> Self {
+        let proto: proto::ChannelVisibility = val.into();
         proto.into()
     }
-}
-
-#[derive(Copy, Clone, Debug, Serialize, PartialEq)]
-pub enum PrincipalId {
-    UserId(UserId),
-    DevServerId(DevServerId),
 }
 
 /// Indicate whether a [Buffer] has permissions to edit.

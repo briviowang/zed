@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use async_zip::base::read::stream::ZipFileReader;
-use futures::{io::BufReader, AsyncRead};
+use futures::{AsyncRead, io::BufReader};
 
 pub async fn extract_zip<R: AsyncRead + Unpin>(destination: &Path, reader: R) -> Result<()> {
     let mut reader = ZipFileReader::new(BufReader::new(reader));
@@ -20,7 +20,7 @@ pub async fn extract_zip<R: AsyncRead + Unpin>(destination: &Path, reader: R) ->
             std::fs::create_dir_all(&path)?;
         } else {
             let parent_dir = path.parent().expect("failed to get parent directory");
-            std::fs::create_dir_all(&parent_dir)?;
+            std::fs::create_dir_all(parent_dir)?;
             let mut file = smol::fs::File::create(&path).await?;
             futures::io::copy(entry_reader, &mut file).await?;
         }
@@ -35,8 +35,8 @@ pub async fn extract_zip<R: AsyncRead + Unpin>(destination: &Path, reader: R) ->
 mod tests {
     use std::path::PathBuf;
 
-    use async_zip::base::write::ZipFileWriter;
     use async_zip::ZipEntryBuilder;
+    use async_zip::base::write::ZipFileWriter;
     use futures::AsyncWriteExt;
     use smol::io::Cursor;
     use tempfile::TempDir;
@@ -82,11 +82,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path();
 
-        std::fs::write(&dst.join("test"), "Hello world.").unwrap();
-        std::fs::create_dir_all(&dst.join("foo/bar")).unwrap();
-        std::fs::write(&dst.join("foo/bar.txt"), "Foo bar.").unwrap();
-        std::fs::write(&dst.join("foo/dar.md"), "Bar dar.").unwrap();
-        std::fs::write(&dst.join("foo/bar/dar你好.txt"), "你好世界").unwrap();
+        std::fs::write(dst.join("test"), "Hello world.").unwrap();
+        std::fs::create_dir_all(dst.join("foo/bar")).unwrap();
+        std::fs::write(dst.join("foo/bar.txt"), "Foo bar.").unwrap();
+        std::fs::write(dst.join("foo/dar.md"), "Bar dar.").unwrap();
+        std::fs::write(dst.join("foo/bar/dar你好.txt"), "你好世界").unwrap();
 
         dir
     }
@@ -102,7 +102,7 @@ mod tests {
         let zip_file = test_dir.path().join("test.zip");
 
         smol::block_on(async {
-            compress_zip(&test_dir.path(), &zip_file).await.unwrap();
+            compress_zip(test_dir.path(), &zip_file).await.unwrap();
             let reader = read_archive(&zip_file).await;
 
             let dir = tempfile::tempdir().unwrap();

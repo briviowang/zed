@@ -7,17 +7,15 @@ To open the assistant panel, toggle the right dock by using the {#action workspa
 
 > **Note**: A custom [key binding](../key-bindings.md) can be set to toggle the right dock.
 
-Once you have [configured a provider](./configuration.md#providers), you can interact with the provider's language models in a context editor.
+Once you have [configured a provider](./configuration.md#providers), you can interact with the provider's language models.
 
-![](https://private-user-images.githubusercontent.com/1714999/359287532-abd8f918-e65f-44ce-a853-1e90f852e206.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MjQxMDk2OTIsIm5iZiI6MTcyNDEwOTM5MiwicGF0aCI6Ii8xNzE0OTk5LzM1OTI4NzUzMi1hYmQ4ZjkxOC1lNjVmLTQ0Y2UtYTg1My0xZTkwZjg1MmUyMDYucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI0MDgxOSUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNDA4MTlUMjMxNjMyWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9MDhlMjZhMjI0NjM3M2JiZmEzMWU5ZWIwYWRjZjhkNTI3NTkyM2JlNmNjODcyMjg3YjkxNjIxNmI5ZTk1ZWRjZCZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QmYWN0b3JfaWQ9MCZrZXlfaWQ9MCZyZXBvX2lkPTAifQ.NiiQkF65VvBKCJs_zNxmjpyvKGK6Hw1aIWA3Xc87XRs)
+To create a new chat in the assistant panel, press {#kb workspace::NewFile} or use the menu in the top right of the assistant panel and select the `New Chat` option.
 
-To create a new context editor, press {#kb workspace::NewFile} or use the menu in the top right of the assistant panel and select the `New Context` option.
-
-In the context editor, select a model from one of the configured providers, type a message in the `You` block, and submit with {#kb assistant::Assist}.
+In the panel, select a model from one of the configured providers, type a message in the `You` block, and submit with {#kb assistant::Assist}.
 
 ### Interacting with the Assistant
 
-The context editor in Zed functions similarly to any other editor. You can use custom key bindings and work with multiple cursors, allowing for seamless transitions between coding and engaging in discussions with the language models.
+The assistant panel in Zed functions similarly to any other editor. You can use custom key bindings and work with multiple cursors, allowing for seamless transitions between coding and engaging in discussions with the language models.
 
 However, the assistant editor differs with the inclusion of message blocks. These blocks serve as containers for text that correspond to different roles within the context. These roles include:
 
@@ -43,13 +41,13 @@ After submitting a message, the assistant's response will be streamed below, in 
 
 The stream can be canceled at any point with <kbd>escape</kbd>. This is useful if you realize early on that the response is not what you were looking for.
 
-If you want to start a new conversation at any time, you can hit <kbd>cmd-n|ctrl-n</kbd> or use the `New Context` menu option in the hamburger menu at the top left of the panel.
+If you want to start a new conversation at any time, you can hit <kbd>cmd-n|ctrl-n</kbd> or use the `New Chat` menu option in the hamburger menu at the top left of the panel.
 
 Simple back-and-forth conversations work well with the assistant. However, there may come a time when you want to modify the previous text in the conversation and steer it in a different direction.
 
 ### Editing a Context
 
-> **Note**: Wondering about Context vs Conversation? [Read more here](./contexts.md).
+> **Note**: Wondering about Context vs. Conversation? [Read more here](./contexts.md).
 
 The assistant gives you the flexibility to have control over the context. You can freely edit any previous text, including the responses from the assistant. If you want to remove a message block entirely, simply place your cursor at the beginning of the block and use the `delete` key. A typical workflow might involve making edits and adjustments throughout the context to refine your inquiry or provide additional information. Here's an example:
 
@@ -61,7 +59,7 @@ The assistant gives you the flexibility to have control over the context. You ca
 6. Add additional context to your original message.
 7. Submit the message with {#kb assistant::Assist}.
 
-Being able to edit previous messages gives you control over how tokens are used. You don't need to start up a new context to correct a mistake or to add additional information, and you don't have to waste tokens by submitting follow-up corrections.
+Being able to edit previous messages gives you control over how tokens are used. You don't need to start up a new chats to correct a mistake or to add additional information, and you don't have to waste tokens by submitting follow-up corrections.
 
 > **Note**: The act of editing past messages is often referred to as "Rewriting History" in the context of the language models.
 

@@ -8,22 +8,51 @@ use std::env;
 fn main() {
     let target = env::var("CARGO_CFG_TARGET_OS");
     println!("cargo::rustc-check-cfg=cfg(gles)");
+
+    #[cfg(any(not(target_os = "macos"), feature = "macos-blade"))]
+    check_wgsl_shaders();
+
     match target.as_deref() {
         Ok("macos") => {
             #[cfg(target_os = "macos")]
             macos::build();
         }
+        #[cfg(target_os = "windows")]
         Ok("windows") => {
             let manifest = std::path::Path::new("resources/windows/gpui.manifest.xml");
             let rc_file = std::path::Path::new("resources/windows/gpui.rc");
             println!("cargo:rerun-if-changed={}", manifest.display());
             println!("cargo:rerun-if-changed={}", rc_file.display());
-            embed_resource::compile(rc_file, embed_resource::NONE);
+            embed_resource::compile(rc_file, embed_resource::NONE)
+                .manifest_required()
+                .unwrap();
         }
         _ => (),
     };
 }
 
+#[allow(dead_code)]
+fn check_wgsl_shaders() {
+    use std::path::PathBuf;
+    use std::process;
+    use std::str::FromStr;
+
+    let shader_source_path = "./src/platform/blade/shaders.wgsl";
+    let shader_path = PathBuf::from_str(shader_source_path).unwrap();
+    println!("cargo:rerun-if-changed={}", &shader_path.display());
+
+    let shader_source = std::fs::read_to_string(&shader_path).unwrap();
+
+    match naga::front::wgsl::parse_str(&shader_source) {
+        Ok(_) => {
+            // All clear
+        }
+        Err(e) => {
+            eprintln!("WGSL shader compilation failed:\n{}", e);
+            process::exit(1);
+        }
+    }
+}
 #[cfg(target_os = "macos")]
 mod macos {
     use std::{
@@ -48,6 +77,7 @@ mod macos {
 
     fn generate_dispatch_bindings() {
         println!("cargo:rustc-link-lib=framework=System");
+        println!("cargo:rustc-link-lib=framework=ScreenCaptureKit");
         println!("cargo:rerun-if-changed=src/platform/mac/dispatch.h");
 
         let bindings = bindgen::Builder::default()
@@ -81,9 +111,12 @@ mod macos {
     fn generate_shader_bindings() -> PathBuf {
         let output_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("scene.h");
         let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-        let mut config = Config::default();
-        config.include_guard = Some("SCENE_H".into());
-        config.language = cbindgen::Language::C;
+        let mut config = Config {
+            include_guard: Some("SCENE_H".into()),
+            language: cbindgen::Language::C,
+            no_includes: true,
+            ..Default::default()
+        };
         config.export.include.extend([
             "Bounds".into(),
             "Corners".into(),
@@ -103,6 +136,7 @@ mod macos {
             "Underline".into(),
             "UnderlineInputIndex".into(),
             "Quad".into(),
+            "BorderStyle".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),
@@ -178,7 +212,7 @@ mod macos {
                 "-c",
                 shader_path,
                 "-include",
-                &header_path.to_str().unwrap(),
+                (header_path.to_str().unwrap()),
                 "-o",
             ])
             .arg(&air_output_path)

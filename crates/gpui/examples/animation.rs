@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use gpui::*;
+use anyhow::Result;
+use gpui::{
+    Animation, AnimationExt as _, App, Application, AssetSource, Bounds, Context, SharedString,
+    Transformation, Window, WindowBounds, WindowOptions, black, bounce, div, ease_in_out,
+    percentage, prelude::*, px, rgb, size, svg,
+};
 
 struct Assets {}
 
@@ -9,7 +14,7 @@ impl AssetSource for Assets {
         std::fs::read(path)
             .map(Into::into)
             .map_err(Into::into)
-            .map(|result| Some(result))
+            .map(Some)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
@@ -23,7 +28,7 @@ impl AssetSource for Assets {
     }
 }
 
-const ARROW_CIRCLE_SVG: &'static str = concat!(
+const ARROW_CIRCLE_SVG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/examples/image/arrow_circle.svg"
 );
@@ -31,13 +36,13 @@ const ARROW_CIRCLE_SVG: &'static str = concat!(
 struct AnimationExample {}
 
 impl Render for AnimationExample {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().size_full().justify_around().child(
             div().flex().flex_row().w_full().justify_around().child(
                 div()
                     .flex()
                     .bg(rgb(0x2e7d32))
-                    .size(Length::Definite(Pixels(300.0).into()))
+                    .size(px(300.0))
                     .justify_center()
                     .items_center()
                     .shadow_lg()
@@ -67,9 +72,9 @@ impl Render for AnimationExample {
 }
 
 fn main() {
-    App::new()
+    Application::new()
         .with_assets(Assets {})
-        .run(|cx: &mut AppContext| {
+        .run(|cx: &mut App| {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -78,9 +83,9 @@ fn main() {
                 ))),
                 ..Default::default()
             };
-            cx.open_window(options, |cx| {
+            cx.open_window(options, |_, cx| {
                 cx.activate(false);
-                cx.new_view(|_cx| AnimationExample {})
+                cx.new(|_| AnimationExample {})
             })
             .unwrap();
         });

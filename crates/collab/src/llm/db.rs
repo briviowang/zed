@@ -20,16 +20,16 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-pub use queries::usages::ActiveUserCount;
-use sea_orm::prelude::*;
+pub use queries::usages::{ActiveUserCount, TokenUsage};
 pub use sea_orm::ConnectOptions;
+use sea_orm::prelude::*;
 use sea_orm::{
     ActiveValue, DatabaseConnection, DatabaseTransaction, IsolationLevel, TransactionTrait,
 };
 
+use crate::Result;
 use crate::db::TransactionHandle;
 use crate::executor::Executor;
-use crate::Result;
 
 /// The database for the LLM service.
 pub struct LlmDatabase {
@@ -67,6 +67,14 @@ impl LlmDatabase {
         Ok(())
     }
 
+    /// Returns the list of all known models, with their [`LanguageModelProvider`].
+    pub fn all_models(&self) -> Vec<(LanguageModelProvider, model::Model)> {
+        self.models
+            .iter()
+            .map(|((model_provider, _model_name), model)| (*model_provider, model.clone()))
+            .collect::<Vec<_>>()
+    }
+
     /// Returns the names of the known models for the given [`LanguageModelProvider`].
     pub fn model_names_for_provider(&self, provider: LanguageModelProvider) -> Vec<String> {
         self.models
@@ -89,6 +97,14 @@ impl LlmDatabase {
             .ok_or_else(|| anyhow!("unknown model {provider:?}:{name}"))?)
     }
 
+    pub fn model_by_id(&self, id: ModelId) -> Result<&model::Model> {
+        Ok(self
+            .models
+            .values()
+            .find(|model| model.id == id)
+            .ok_or_else(|| anyhow!("no model for ID {id:?}"))?)
+    }
+
     pub fn options(&self) -> &ConnectOptions {
         &self.options
     }
@@ -102,14 +118,12 @@ impl LlmDatabase {
             let (tx, result) = self.with_transaction(&f).await?;
             match result {
                 Ok(result) => match tx.commit().await.map_err(Into::into) {
-                    Ok(()) => return Ok(result),
-                    Err(error) => {
-                        return Err(error);
-                    }
+                    Ok(()) => Ok(result),
+                    Err(error) => Err(error),
                 },
                 Err(error) => {
                     tx.rollback().await?;
-                    return Err(error);
+                    Err(error)
                 }
             }
         };
